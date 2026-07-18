@@ -12,6 +12,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+static double vk_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec*1000.0 + t.tv_nsec/1e6; }
 
 #define VKCHECK(x, what) do { VkResult _r = (x); if (_r != VK_SUCCESS) { \
     fprintf(stderr, "[VK] %s failed: %d\n", what, _r); return 0; } } while (0)
@@ -34,7 +36,8 @@ static struct {
     VkDevice dev;
     VkQueue queue;
     uint32_t qfam;
-    uint32_t memtype;            // HOST_VISIBLE|HOST_COHERENT (prefer DEVICE_LOCAL)
+    uint32_t memtype;            // HOST_VISIBLE|HOST_COHERENT (prefer DEVICE_LOCAL) — for inputs/weights
+    uint32_t memtype_cached;     // HOST_CACHED — for buffers the CPU reads back (outputs)
     VkDescriptorSetLayout dsl;
     VkPipelineLayout plyt;
     VkPipeline pipe;
@@ -80,7 +83,21 @@ static int pick_memtype(void) {
     return best;
 }
 
-static int alloc_hostvis(size_t bytes, VkBuffer *buf, VkDeviceMemory *mem, void **ptr) {
+/* Cached+coherent host-visible type for buffers the CPU READS BACK. pick_memtype prefers
+ * DEVICE_LOCAL host-visible = write-combined VRAM over ReBAR, which the CPU writes fast but
+ * reads catastrophically slowly (~40 MB/s). Outputs must be HOST_CACHED for cheap readback. */
+static int pick_memtype_cached(void) {
+    VkPhysicalDeviceMemoryProperties m;
+    vkGetPhysicalDeviceMemoryProperties(G.phys, &m);
+    for (uint32_t i = 0; i < m.memoryTypeCount; i++) {
+        VkMemoryPropertyFlags f = m.memoryTypes[i].propertyFlags;
+        if ((f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && (f & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) &&
+            (f & VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) return (int)i;
+    }
+    return pick_memtype();   /* no cached type -> fall back (no worse than before) */
+}
+
+static int alloc_hostvis_mt(size_t bytes, VkBuffer *buf, VkDeviceMemory *mem, void **ptr, uint32_t memtype) {
     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
         .size = bytes, .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
@@ -88,21 +105,25 @@ static int alloc_hostvis(size_t bytes, VkBuffer *buf, VkDeviceMemory *mem, void 
     VkMemoryRequirements req;
     vkGetBufferMemoryRequirements(G.dev, *buf, &req);
     VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-        .allocationSize = req.size, .memoryTypeIndex = G.memtype};
+        .allocationSize = req.size, .memoryTypeIndex = memtype};
     VKCHECK(vkAllocateMemory(G.dev, &ai, NULL, mem), "vkAllocateMemory");
     VKCHECK(vkBindBufferMemory(G.dev, *buf, *mem, 0), "vkBindBufferMemory");
     if (ptr) VKCHECK(vkMapMemory(G.dev, *mem, 0, bytes, 0, ptr), "vkMapMemory");
     return 1;
 }
+static int alloc_hostvis(size_t bytes, VkBuffer *buf, VkDeviceMemory *mem, void **ptr) {
+    return alloc_hostvis_mt(bytes, buf, mem, ptr, G.memtype);
+}
 
-static int scratch_reserve(Scratch *s, size_t bytes) {
+static int scratch_reserve_mt(Scratch *s, size_t bytes, uint32_t memtype) {
     if (s->cap >= bytes) return 1;
     if (s->buf) { vkDestroyBuffer(G.dev, s->buf, NULL); vkFreeMemory(G.dev, s->mem, NULL); }
     s->buf = VK_NULL_HANDLE; s->cap = 0; s->ptr = NULL;
-    if (!alloc_hostvis(bytes, &s->buf, &s->mem, &s->ptr)) return 0;
+    if (!alloc_hostvis_mt(bytes, &s->buf, &s->mem, &s->ptr, memtype)) return 0;
     s->cap = bytes;
     return 1;
 }
+static int scratch_reserve(Scratch *s, size_t bytes) { return scratch_reserve_mt(s, bytes, G.memtype); }
 
 static int rowwords(int fmt, int I) {
     size_t rb = fmt == 1 ? (size_t)I : (size_t)(I + 1) / 2; // bytes/row on CPU side
@@ -213,6 +234,7 @@ int coli_vk_init(const char *spv_path) {
     int mt = pick_memtype();
     if (mt < 0) { fprintf(stderr, "[VK] no host-visible memory\n"); return 0; }
     G.memtype = (uint32_t)mt;
+    G.memtype_cached = (uint32_t)pick_memtype_cached();
 
     G.shader = load_spv(spv_path);
     if (!G.shader) return 0;
@@ -284,7 +306,7 @@ int coli_vk_matmul(ColiVkTensor **tensor, float *y, const float *x,
     ColiVkTensor *t = *tensor;
     size_t xb = (size_t)S * I * sizeof(float), yb = (size_t)S * O * sizeof(float);
     VkBuffer old_x = G.x.buf, old_y = G.y.buf;
-    if (!scratch_reserve(&G.x, xb) || !scratch_reserve(&G.y, yb)) return 0;
+    if (!scratch_reserve(&G.x, xb) || !scratch_reserve_mt(&G.y, yb, G.memtype_cached)) return 0;  /* y read back */
     memcpy(G.x.ptr, x, xb);
 
     /* Rebind descriptors only when the tensor or a scratch buffer changed (a realloc
@@ -351,7 +373,7 @@ int coli_vk_gate_up(ColiVkTensor **gate, ColiVkTensor **up, float *hidden, const
     if (!upload_tensor(gate, gw, gs, fmt, D, I) || !upload_tensor(up, uw, us, fmt, D, I)) return 0;
     ColiVkTensor *tg = *gate, *tu = *up;
     size_t xb = (size_t)S * D * sizeof(float), hb = (size_t)S * I * sizeof(float);
-    if (!scratch_reserve(&G.x, xb) || !scratch_reserve(&G.h, hb)) return 0;
+    if (!scratch_reserve(&G.x, xb) || !scratch_reserve_mt(&G.h, hb, G.memtype_cached)) return 0;  /* hidden read back */
     memcpy(G.x.ptr, x, xb);
 
     VkDescriptorBufferInfo bi[6] = {
@@ -408,8 +430,12 @@ int coli_vk_expert_group(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
             ups[c]->I != D || ups[c]->O != I || downs[c]->I != I || downs[c]->O != D) return 0;
     }
     size_t xb = (size_t)total*D*4, hb = (size_t)total*I*4, yb = (size_t)total*D*4;
-    if (!scratch_reserve(&G.eg_x, xb) || !scratch_reserve(&G.eg_h, hb) || !scratch_reserve(&G.eg_y, yb)) return 0;
+    if (!scratch_reserve(&G.eg_x, xb) || !scratch_reserve(&G.eg_h, hb) ||
+        !scratch_reserve_mt(&G.eg_y, yb, G.memtype_cached)) return 0;   /* eg_y is read back -> cached */
+    int prof = getenv("VK_PROF") != NULL; double t0=0,t1=0,t2=0,t3=0,t4=0,t5=0;
+    if (prof) t0 = vk_now();
     memcpy(G.eg_x.ptr, x, xb);
+    if (prof) t1 = vk_now();
 
     if (!G.eg_pool) {   /* one-time: 64 gate_up (6-binding) + 64 down (4-binding) sets */
         VkDescriptorPoolSize ps = {.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 64*6 + 64*4};
@@ -435,6 +461,7 @@ int coli_vk_expert_group(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
             {downs[c]->sbuf, 0, VK_WHOLE_SIZE}, {G.eg_y.buf, yo, (VkDeviceSize)rows[c]*D*4}};
         wr_desc(G.eg_dn[c], 4, di);
     }
+    if (prof) t2 = vk_now();
 
     VKCHECK(vkResetCommandBuffer(G.cmd, 0), "resetCmd");
     VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
@@ -458,12 +485,17 @@ int coli_vk_expert_group(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
         vkCmdDispatch(G.cmd, (uint32_t)((D + 7) / 8), (uint32_t)rows[c], 1);
     }
     VKCHECK(vkEndCommandBuffer(G.cmd), "endCmd");
+    if (prof) t3 = vk_now();
 
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd};
     VKCHECK(vkResetFences(G.dev, 1, &G.fence), "resetFence");
     VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.fence), "queueSubmit");
     if (vkWaitForFences(G.dev, 1, &G.fence, VK_TRUE, 10000000000ULL) != VK_SUCCESS) { G.ready = 0; return 0; }
+    if (prof) t4 = vk_now();
     memcpy(y, G.eg_y.ptr, yb);
+    if (prof) { t5 = vk_now();
+        fprintf(stderr, "[VK_PROF] K=%d memcpy_x %.3f | desc %.3f | record %.3f | gpu %.3f | memcpy_y %.3f ms\n",
+                count, t1-t0, t2-t1, t3-t2, t4-t3, t5-t4); }
     G.cmd_ready = 0; G.bound_tensor = NULL;
     return 1;
 }
