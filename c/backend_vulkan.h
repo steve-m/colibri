@@ -40,6 +40,14 @@ int  coli_vk_gate_up(ColiVkTensor **gate, ColiVkTensor **up,
                      const void *uw, const float *us,
                      int fmt, int S, int D, int I);
 
+/* Full batched expert MLP for `count` experts in ONE submit, hidden staying on-device:
+ * for each c, y_c = down_c(silu(gate_c(x_c)) * up_c(x_c)). x/y packed [sum(rows)*D];
+ * experts are resident (gate/up: D->I, down: I->D). Mirrors coli_cuda_expert_group.
+ * Returns 0 -> caller falls back to CPU. */
+int  coli_vk_expert_group(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
+                          ColiVkTensor *const *downs, const int *rows, int count,
+                          float *y, const float *x);
+
 void   coli_vk_tensor_free(ColiVkTensor *t);
 size_t coli_vk_tensor_bytes(const ColiVkTensor *t);
 

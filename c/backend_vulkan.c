@@ -48,6 +48,11 @@ static struct {
     VkCommandBuffer cmd;
     VkFence fence;
     Scratch x, y, h;   /* h = fused gate+up hidden output */
+    /* full expert-group scratch: activations/hidden/output for K experts + per-expert
+     * descriptor sets (gate_up: dsl_gu, down: dsl), so gate_up->down runs on-device in
+     * one submit with hidden never leaving the GPU. */
+    Scratch eg_x, eg_h, eg_y;
+    VkDescriptorPool eg_pool; VkDescriptorSet eg_gu[64], eg_dn[64]; int eg_nsets;
     /* resubmit cache: skip vkUpdateDescriptorSets + command re-record when the bound
      * tensor / shape / scratch buffers are unchanged from the previous call (the hot-
      * expert-called-repeatedly pattern). The synchronous fence wait each call means no
@@ -379,6 +384,90 @@ int coli_vk_gate_up(ColiVkTensor **gate, ColiVkTensor **up, float *hidden, const
     return 1;
 }
 
+static void wr_desc(VkDescriptorSet set, int n, const VkDescriptorBufferInfo *bi) {
+    VkWriteDescriptorSet w[6];
+    for (int i = 0; i < n; i++) w[i] = (VkWriteDescriptorSet){
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = (uint32_t)i,
+        .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi[i]};
+    vkUpdateDescriptorSets(G.dev, (uint32_t)n, w, 0, NULL);
+}
+
+/* Full batched expert MLP for `count` experts in ONE submit, hidden staying on-device:
+ * for each c, hidden_c = silu(gate_c(x_c))*up_c(x_c) (fused), then y_c = down_c(hidden_c).
+ * x/y are packed [sum(rows)*D]; experts are resident VkTensors (gate/up: D->I, down: I->D).
+ * Mirrors coli_cuda_expert_group. Returns 0 -> caller falls back to CPU. */
+int coli_vk_expert_group(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
+                         ColiVkTensor *const *downs, const int *rows, int count,
+                         float *y, const float *x) {
+    if (!G.ready || !G.shader_gu || count < 1 || count > 64) return 0;
+    ColiVkTensor *g0 = gates[0]; if (!g0) return 0;
+    int D = g0->I, I = g0->O, fmt = g0->fmt, total = 0, off[64];
+    for (int c = 0; c < count; c++) {
+        off[c] = total; total += rows[c];
+        if (rows[c] < 1 || gates[c]->I != D || gates[c]->O != I || gates[c]->fmt != fmt ||
+            ups[c]->I != D || ups[c]->O != I || downs[c]->I != I || downs[c]->O != D) return 0;
+    }
+    size_t xb = (size_t)total*D*4, hb = (size_t)total*I*4, yb = (size_t)total*D*4;
+    if (!scratch_reserve(&G.eg_x, xb) || !scratch_reserve(&G.eg_h, hb) || !scratch_reserve(&G.eg_y, yb)) return 0;
+    memcpy(G.eg_x.ptr, x, xb);
+
+    if (!G.eg_pool) {   /* one-time: 64 gate_up (6-binding) + 64 down (4-binding) sets */
+        VkDescriptorPoolSize ps = {.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 64*6 + 64*4};
+        VkDescriptorPoolCreateInfo dpi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 128, .poolSizeCount = 1, .pPoolSizes = &ps};
+        VKCHECK(vkCreateDescriptorPool(G.dev, &dpi, NULL, &G.eg_pool), "eg descPool");
+        VkDescriptorSetLayout lg[64], ld[64];
+        for (int c = 0; c < 64; c++) { lg[c] = G.dsl_gu; ld[c] = G.dsl; }
+        VkDescriptorSetAllocateInfo ag = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = G.eg_pool, .descriptorSetCount = 64, .pSetLayouts = lg};
+        VkDescriptorSetAllocateInfo ad = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = G.eg_pool, .descriptorSetCount = 64, .pSetLayouts = ld};
+        VKCHECK(vkAllocateDescriptorSets(G.dev, &ag, G.eg_gu), "eg gu sets");
+        VKCHECK(vkAllocateDescriptorSets(G.dev, &ad, G.eg_dn), "eg dn sets");
+        G.eg_nsets = 64;
+    }
+    for (int c = 0; c < count; c++) {
+        VkDeviceSize xo = (VkDeviceSize)off[c]*D*4, ho = (VkDeviceSize)off[c]*I*4, yo = (VkDeviceSize)off[c]*D*4;
+        VkDescriptorBufferInfo gi[6] = {
+            {G.eg_x.buf, xo, (VkDeviceSize)rows[c]*D*4}, {gates[c]->wbuf, 0, VK_WHOLE_SIZE},
+            {gates[c]->sbuf, 0, VK_WHOLE_SIZE}, {ups[c]->wbuf, 0, VK_WHOLE_SIZE},
+            {ups[c]->sbuf, 0, VK_WHOLE_SIZE}, {G.eg_h.buf, ho, (VkDeviceSize)rows[c]*I*4}};
+        wr_desc(G.eg_gu[c], 6, gi);
+        VkDescriptorBufferInfo di[4] = {
+            {G.eg_h.buf, ho, (VkDeviceSize)rows[c]*I*4}, {downs[c]->wbuf, 0, VK_WHOLE_SIZE},
+            {downs[c]->sbuf, 0, VK_WHOLE_SIZE}, {G.eg_y.buf, yo, (VkDeviceSize)rows[c]*D*4}};
+        wr_desc(G.eg_dn[c], 4, di);
+    }
+
+    VKCHECK(vkResetCommandBuffer(G.cmd, 0), "resetCmd");
+    VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    VKCHECK(vkBeginCommandBuffer(G.cmd, &begin), "beginCmd");
+    VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT};
+    /* phase 1: fused gate+up+silu -> hidden (per expert, bound to its x/hidden slices) */
+    vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_gu);
+    for (int c = 0; c < count; c++) {
+        struct PC pc = {fmt, rows[c], D, I, gates[c]->rowWords};
+        vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_gu, 0, 1, &G.eg_gu[c], 0, NULL);
+        vkCmdPushConstants(G.cmd, G.plyt_gu, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+        vkCmdDispatch(G.cmd, (uint32_t)((I + 7) / 8), (uint32_t)rows[c], 1);
+    }
+    vkCmdPipelineBarrier(G.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+    /* phase 2: down projection hidden -> y */
+    vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe);
+    for (int c = 0; c < count; c++) {
+        struct PC pc = {fmt, rows[c], I, D, downs[c]->rowWords};
+        vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt, 0, 1, &G.eg_dn[c], 0, NULL);
+        vkCmdPushConstants(G.cmd, G.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+        vkCmdDispatch(G.cmd, (uint32_t)((D + 7) / 8), (uint32_t)rows[c], 1);
+    }
+    VKCHECK(vkEndCommandBuffer(G.cmd), "endCmd");
+
+    VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd};
+    VKCHECK(vkResetFences(G.dev, 1, &G.fence), "resetFence");
+    VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.fence), "queueSubmit");
+    if (vkWaitForFences(G.dev, 1, &G.fence, VK_TRUE, 10000000000ULL) != VK_SUCCESS) { G.ready = 0; return 0; }
+    memcpy(y, G.eg_y.ptr, yb);
+    G.cmd_ready = 0; G.bound_tensor = NULL;
+    return 1;
+}
+
 void coli_vk_tensor_free(ColiVkTensor *t) {
     if (!t) return;
     if (G.bound_tensor == t) { G.bound_tensor = NULL; G.cmd_ready = 0; }  /* drop stale cache */
@@ -405,6 +494,10 @@ void coli_vk_shutdown(void) {
     if (G.x.buf) { vkDestroyBuffer(G.dev, G.x.buf, NULL); vkFreeMemory(G.dev, G.x.mem, NULL); }
     if (G.y.buf) { vkDestroyBuffer(G.dev, G.y.buf, NULL); vkFreeMemory(G.dev, G.y.mem, NULL); }
     if (G.h.buf) { vkDestroyBuffer(G.dev, G.h.buf, NULL); vkFreeMemory(G.dev, G.h.mem, NULL); }
+    if (G.eg_x.buf) { vkDestroyBuffer(G.dev, G.eg_x.buf, NULL); vkFreeMemory(G.dev, G.eg_x.mem, NULL); }
+    if (G.eg_h.buf) { vkDestroyBuffer(G.dev, G.eg_h.buf, NULL); vkFreeMemory(G.dev, G.eg_h.mem, NULL); }
+    if (G.eg_y.buf) { vkDestroyBuffer(G.dev, G.eg_y.buf, NULL); vkFreeMemory(G.dev, G.eg_y.mem, NULL); }
+    if (G.eg_pool) vkDestroyDescriptorPool(G.dev, G.eg_pool, NULL);
     vkDestroyFence(G.dev, G.fence, NULL);
     vkDestroyCommandPool(G.dev, G.cpool, NULL);
     vkDestroyDescriptorPool(G.dev, G.dpool, NULL);
@@ -616,6 +709,68 @@ static double bench_experts_fair(int fmt, int D, int I, int K, int Npass) {
     return ms;
 }
 
+/* Full expert-group correctness (vs CPU ref) + fair throughput: K distinct experts,
+ * one submit, hidden on-device. The real comparison to ROCm's coli_cuda_expert_group. */
+static int run_expert_group(int fmt, int D, int I, int K) {
+    if (K > 64) K = 64;
+    size_t gu_rb = fmt == 1 ? (size_t)D : (size_t)(D + 1) / 2;
+    size_t d_rb  = fmt == 1 ? (size_t)I : (size_t)(I + 1) / 2;
+    ColiVkTensor *tg[64] = {0}, *tu[64] = {0}, *td[64] = {0};
+    uint8_t *hgw[64], *huw[64], *hdw[64]; float *hgs[64], *hus[64], *hds[64];
+    float *x = malloc((size_t)K*D*4), *yg = malloc((size_t)K*D*4), *yc = malloc((size_t)K*D*4);
+    float *tmp = malloc((size_t)(D > I ? D : I) * 4);
+    for (int i = 0; i < K*D; i++) x[i] = (rand()%200-100)/100.0f;
+    for (int c = 0; c < K; c++) {
+        hgw[c] = malloc(gu_rb*I); huw[c] = malloc(gu_rb*I); hdw[c] = malloc(d_rb*D);
+        for (size_t i = 0; i < gu_rb*I; i++) { hgw[c][i] = rand()&0xff; huw[c][i] = rand()&0xff; }
+        for (size_t i = 0; i < d_rb*D; i++) hdw[c][i] = rand()&0xff;
+        hgs[c] = malloc((size_t)I*4); hus[c] = malloc((size_t)I*4); hds[c] = malloc((size_t)D*4);
+        for (int o = 0; o < I; o++) { hgs[c][o] = 0.01f+(rand()%100)/10000.0f; hus[c][o] = 0.01f+(rand()%100)/10000.0f; }
+        for (int o = 0; o < D; o++) hds[c][o] = 0.01f+(rand()%100)/10000.0f;
+        coli_vk_matmul(&tg[c], tmp, x, hgw[c], hgs[c], fmt, 1, D, I);   /* upload gate  (D->I) */
+        coli_vk_matmul(&tu[c], tmp, x, huw[c], hus[c], fmt, 1, D, I);   /* upload up    (D->I) */
+        coli_vk_matmul(&td[c], tmp, x, hdw[c], hds[c], fmt, 1, I, D);   /* upload down  (I->D) */
+    }
+    int rows[64]; for (int c = 0; c < K; c++) rows[c] = 1;
+    if (!coli_vk_expert_group(tg, tu, td, rows, K, yg, x)) { printf("expert_group failed\n"); return 1; }
+    float *hid = malloc((size_t)I*4);
+    for (int c = 0; c < K; c++) {
+        float *xc = x + (size_t)c*D;
+        for (int o = 0; o < I; o++) {
+            double g = 0, u = 0; const uint8_t *gr = hgw[c]+(size_t)o*gu_rb, *ur = huw[c]+(size_t)o*gu_rb;
+            for (int i = 0; i < D; i++) { g += xc[i]*deq(gr,fmt,i); u += xc[i]*deq(ur,fmt,i); }
+            float gt = (float)(g*hgs[c][o]), ut = (float)(u*hus[c][o]);
+            hid[o] = (gt/(1.0f+expf(-gt)))*ut;
+        }
+        for (int d = 0; d < D; d++) {
+            double sdot = 0; const uint8_t *dr = hdw[c]+(size_t)d*d_rb;
+            for (int o = 0; o < I; o++) sdot += hid[o]*deq(dr,fmt,o);
+            yc[c*D+d] = (float)(sdot*hds[c][d]);
+        }
+    }
+    double maxrel = 0;
+    for (int i = 0; i < K*D; i++) { double e = fabs(yg[i]-yc[i]); if (fabs(yc[i])>1e-2) { double r = e/fabs(yc[i]); if (r>maxrel) maxrel = r; } }
+    coli_vk_expert_group(tg, tu, td, rows, K, yg, x);   /* warm + leaves G.cmd recorded */
+    int iters = 20; double t0 = now();
+    for (int k = 0; k < iters; k++) coli_vk_expert_group(tg, tu, td, rows, K, yg, x);
+    double ms = (now()-t0)*1000.0/iters/K;
+    /* GPU-only: re-submit the already-recorded command buffer (skips per-call host setup:
+     * descriptor updates + recording), isolating raw GPU throughput. */
+    VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd};
+    for (int w = 0; w < 2; w++) { vkResetFences(G.dev,1,&G.fence); vkQueueSubmit(G.queue,1,&si,G.fence); vkWaitForFences(G.dev,1,&G.fence,VK_TRUE,10000000000ULL); }
+    double g0 = now();
+    for (int k = 0; k < iters; k++) { vkResetFences(G.dev,1,&G.fence); vkQueueSubmit(G.queue,1,&si,G.fence); vkWaitForFences(G.dev,1,&G.fence,VK_TRUE,10000000000ULL); }
+    double gpums = (now()-g0)*1000.0/iters/K;
+    printf("FULL VK expert_group fmt=%d %2d experts | maxrel=%.4g | per-call %.4f  GPU-only %.4f ms/expert (ROCm 0.179)\n",
+           fmt, K, maxrel, ms, gpums);
+    free(hid); free(x); free(yg); free(yc); free(tmp);
+    for (int c = 0; c < K; c++) {
+        coli_vk_tensor_free(tg[c]); coli_vk_tensor_free(tu[c]); coli_vk_tensor_free(td[c]);
+        free(hgw[c]); free(huw[c]); free(hdw[c]); free(hgs[c]); free(hus[c]); free(hds[c]);
+    }
+    return maxrel > 1e-3 ? 1 : 0;
+}
+
 int main(int argc, char **argv) {
     const char *spv = argc > 1 ? argv[1] : "shaders/qmatmul.spv";
     if (!coli_vk_init(spv)) { printf("vk init failed\n"); return 1; }
@@ -667,6 +822,11 @@ int main(int argc, char **argv) {
     /* FAIR: cycle 8 distinct experts (VRAM reads, not L2) — matches ROCm expert_group. */
     printf("FAIR fused gate_up int4 6144->2048 (8 distinct experts): %.4f ms/expert\n",
            bench_experts_fair(2, 6144, 2048, 8, 8));
+    /* FULL expert_group: the real primitive. Sweep K to see if per-expert cost is fixed
+     * per-call overhead (drops with K) or per-dispatch (constant). */
+    bad |= run_expert_group(2, 6144, 2048, 1);
+    bad |= run_expert_group(2, 6144, 2048, 8);
+    bad |= run_expert_group(2, 6144, 2048, 32);
     printf(bad ? "FAIL\n" : "PASS\n");
     coli_vk_shutdown();
     return bad;
