@@ -287,6 +287,8 @@ static uint64_t g_last_repin;
 static int g_vulkan;          /* COLI_VULKAN=1: compute routed experts on the Vulkan tier */
 static int g_vk_budget;       /* COLI_VK_EXPERTS: max experts uploaded to VK VRAM (default 1024) */
 static int g_vk_resident;     /* how many experts currently VK-resident */
+static int g_vk_dense;        /* COLI_VK_DENSE=1: run the resident dense matmuls (attention
+                               * projections + shared expert) on Vulkan too */
 #endif
 #ifdef COLI_CUDA
 static int g_cuda_enabled;
@@ -307,6 +309,14 @@ static void qt_cuda_reset(QT *t){
 static void qt_vk_reset(QT *t){
     if(t->vk){ coli_vk_tensor_free(t->vk); t->vk=NULL; }
     t->vk_eligible=0;
+}
+/* Dense matmul on the Vulkan tier: y[S,O] = x[S,I] @ dequant(t)^T. Uploads the resident
+ * int4/int8 weight once (t->vk), then reuses it. Returns 0 (caller runs the CPU matmul)
+ * when VK-dense is off, the format is unsupported, or upload/compute fails. */
+static int vk_matmul_qt(QT *t, float *y, const float *x, int S){
+    if(!g_vk_dense || (t->fmt!=1 && t->fmt!=2)) return 0;
+    const void *w = t->fmt==1 ? (const void*)t->q8 : (const void*)t->q4;
+    return coli_vk_matmul(&t->vk, y, x, w, t->s, t->fmt, S, t->I, t->O);
 }
 #endif
 #ifdef COLI_CUDA
@@ -2442,10 +2452,19 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
         pipe_done=attn_pipe_prefill(m,l,layer,x,0,S,pos_base,out,NULL);
 #endif
     if(!pipe_done){
+#ifdef COLI_VULKAN
+        if(!vk_matmul_qt(&l->q_a, QR, x, S))
+#endif
         matmul_qt_ex(QR, x, &l->q_a, S, 0);
         for(int s=0;s<S;s++){ float *qr=QR+(int64_t)s*c->q_lora;
             rmsnorm(qr, qr, l->q_a_ln, c->q_lora, c->eps); }         /* q_b legge il residuo NORMATO */
+#ifdef COLI_VULKAN
+        if(!vk_matmul_qt(&l->q_b, Q, QR, S))
+#endif
         matmul_qt_ex(Q, QR, &l->q_b, S, 0);
+#ifdef COLI_VULKAN
+        if(!vk_matmul_qt(&l->kv_a, comp, x, S))
+#endif
         matmul_qt_ex(comp, x, &l->kv_a, S, 0);
     }
     if(!pipe_done) for(int s=0;s<S;s++){
@@ -2729,7 +2748,12 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
         }
         }
         m->t_acore+=now_s()-tac; double tao=now_s();
-        if(!cuda_projected){matmul_qt(out, ctx, &l->o, S);} m->t_aout+=now_s()-tao;
+        if(!cuda_projected){
+#ifdef COLI_VULKAN
+            if(!vk_matmul_qt(&l->o, out, ctx, S))
+#endif
+            matmul_qt(out, ctx, &l->o, S);
+        } m->t_aout+=now_s()-tao;
         free(ctx); free(Q); free(QR); free(comp); free(sc_all);
         m->t_attn += now_s()-ta0;
         return;
@@ -3740,9 +3764,18 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
 #endif
     if(!shared_cuda){
         sg=falloc((int64_t)S*sI);su=falloc((int64_t)S*sI);
+#ifdef COLI_VULKAN
+        if(!vk_matmul_qt(&l->sh_gate, sg, x, S))
+#endif
         matmul_qt(sg, x, &l->sh_gate, S);
+#ifdef COLI_VULKAN
+        if(!vk_matmul_qt(&l->sh_up, su, x, S))
+#endif
         matmul_qt(su, x, &l->sh_up,   S);
         for(int64_t z=0;z<(int64_t)S*sI;z++) sg[z]=siluf(sg[z])*su[z];
+#ifdef COLI_VULKAN
+        if(!vk_matmul_qt(&l->sh_down, hh, sg, S))
+#endif
         matmul_qt(hh, sg, &l->sh_down, S);
     }
     if(shared_cuda!=2) for(int64_t z=0;z<(int64_t)S*D;z++) out[z]+=hh[z];
@@ -6877,7 +6910,9 @@ int main(int argc, char **argv){
         g_vulkan = coli_vk_init(spv);
         if(!g_vulkan){ fprintf(stderr,"[VK] Vulkan backend unavailable (need libvulkan + shaders/qmatmul{,_gate_up}.spv)\n"); return 2; }
         g_vk_budget = getenv("COLI_VK_EXPERTS") ? atoi(getenv("COLI_VK_EXPERTS")) : 1024;
-        fprintf(stderr,"[VK] expert tier active: routed int4 experts on the GPU (budget %d)\n", g_vk_budget);
+        g_vk_dense = getenv("COLI_VK_DENSE") ? atoi(getenv("COLI_VK_DENSE")) : 0;
+        fprintf(stderr,"[VK] expert tier active: routed int4 experts on the GPU (budget %d)%s\n",
+                g_vk_budget, g_vk_dense ? " + dense projections + shared expert" : "");
     }
 #endif
 #ifdef COLI_CUDA
