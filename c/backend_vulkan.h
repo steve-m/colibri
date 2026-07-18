@@ -48,6 +48,10 @@ int  coli_vk_expert_group(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
                           ColiVkTensor *const *downs, const int *rows, int count,
                           float *y, const float *x);
 
+/* Upload a resident tensor without computing (expert tier: gate/up/down uploaded once,
+ * then driven by coli_vk_expert_group). Returns 0 on failure/unsupported fmt. */
+int  coli_vk_tensor_ensure(ColiVkTensor **tensor, const void *weights, const float *scales, int fmt, int I, int O);
+
 void   coli_vk_tensor_free(ColiVkTensor *t);
 size_t coli_vk_tensor_bytes(const ColiVkTensor *t);
 

@@ -299,6 +299,13 @@ static int upload_tensor(ColiVkTensor **out, const void *weights, const float *s
     return 1;
 }
 
+/* Upload a resident tensor without computing (for the expert tier: gate/up/down are
+ * uploaded once, then driven by coli_vk_expert_group). Returns 0 on failure. */
+int coli_vk_tensor_ensure(ColiVkTensor **tensor, const void *weights, const float *scales, int fmt, int I, int O) {
+    if (!G.ready) return 0;
+    return upload_tensor(tensor, weights, scales, fmt, I, O);
+}
+
 int coli_vk_matmul(ColiVkTensor **tensor, float *y, const float *x,
                    const void *weights, const float *scales,
                    int fmt, int S, int I, int O) {

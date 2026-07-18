@@ -64,6 +64,9 @@ static inline int omp_get_thread_num(void){ return 0; }
 #ifdef COLI_CUDA
 #include "backend_cuda.h"
 #endif
+#ifdef COLI_VULKAN
+#include "backend_vulkan.h"
+#endif
 #ifdef COLI_METAL
 #include "backend_metal.h"
 #include <omp.h>
@@ -108,6 +111,9 @@ typedef struct {
     int fmt; float *qf; int8_t *q8; uint8_t *q4; float *s; int O, I, gs;  /* gs=group size (0=per-row, 128=grouped) */
 #ifdef COLI_CUDA
     ColiCudaTensor *cuda;
+#endif
+#ifdef COLI_VULKAN
+    ColiVkTensor *vk; int vk_eligible;   /* resident on the Vulkan expert tier */
 #endif
     int cuda_eligible, cuda_failed, cuda_device;  /* resident tensor, never a reused expert slot */
 } QT;
@@ -277,6 +283,11 @@ static void expert_gate_up(float *g,float *u,const float *x,QT *wg,QT *wu,int S)
 
 static int g_repin;
 static uint64_t g_last_repin;
+#ifdef COLI_VULKAN
+static int g_vulkan;          /* COLI_VULKAN=1: compute routed experts on the Vulkan tier */
+static int g_vk_budget;       /* COLI_VK_EXPERTS: max experts uploaded to VK VRAM (default 1024) */
+static int g_vk_resident;     /* how many experts currently VK-resident */
+#endif
 #ifdef COLI_CUDA
 static int g_cuda_enabled;
 static double g_cuda_expert_gb;
@@ -290,6 +301,15 @@ static void qt_cuda_reset(QT *t){
     if(t->cuda){ coli_cuda_tensor_free(t->cuda); t->cuda=NULL; }
     t->cuda_failed=0;
 }
+#endif
+#ifdef COLI_VULKAN
+/* Drop a QT's Vulkan-resident copy (slot reused for a different expert). */
+static void qt_vk_reset(QT *t){
+    if(t->vk){ coli_vk_tensor_free(t->vk); t->vk=NULL; }
+    t->vk_eligible=0;
+}
+#endif
+#ifdef COLI_CUDA
 static int qt_cuda_upload(QT *t){
     if(t->fmt==5||t->fmt==6) return 0;   /* int3-g64 / E8: no CUDA kernel yet — tensor stays CPU-side */
     const void *weights = t->fmt==0 ? (const void*)t->qf
@@ -1463,6 +1483,14 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
     /* A live REPIN may reuse a GPU-enabled pinned slot for a different expert.
      * Keep its tier assignment, but invalidate the old device weights. */
     if(s->eid!=eid){ qt_cuda_reset(&s->g); qt_cuda_reset(&s->u); qt_cuda_reset(&s->d); }
+#endif
+#ifdef COLI_VULKAN
+    /* Slot reused for a different expert: free the stale VK-resident weights so the new
+     * expert re-uploads instead of computing with the old expert's tensors. */
+    if(s->eid!=eid){
+        if(s->g.vk_eligible) g_vk_resident--;
+        qt_vk_reset(&s->g); qt_vk_reset(&s->u); qt_vk_reset(&s->d);
+    }
 #endif
     Cfg *c=&m->c; int I=c->moe_inter, D=c->hidden, b=m->ebits;
     /* suf as a bounded char[][16] (not const char*) lets GCC prove the %s in the
@@ -3144,6 +3172,12 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
     int *group_row=group_enabled?xalloc((size_t)64*S*sizeof(int),"moe group_row"):NULL;
     float *group_weight=group_enabled?xalloc((size_t)64*S*sizeof(float),"moe group_weight"):NULL;
 #endif
+    int vk_active = 0; (void)vk_active;
+#ifdef COLI_VULKAN
+    vk_active = g_vulkan && !omp_in_parallel() && S<=4;
+    float *vk_xh = vk_active?falloc((int64_t)S*K*D):NULL;
+    float *vk_yh = vk_active?falloc((int64_t)S*K*D):NULL;
+#endif
     int shared_on_gpu=0; (void)shared_on_gpu;   /* set by the Metal path when Phase E was fused */
     for(int base=0;base<nu;base+=64){
         int nb = nu-base<64 ? nu-base : 64;
@@ -3361,7 +3395,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
          * on GLM-5.2 int4: identical 256-token greedy output, and on the int4 tiny
          * oracle). Gated off the speculation window like every S-dependent kernel switch. */
         int xexp_done=0;
-        if(g_xexp && !metal_done && S==1 && !nmiss && !spec_pinned() && g_idot && g_i4s<=1
+        if(g_xexp && !metal_done && !vk_active && S==1 && !nmiss && !spec_pinned() && g_idot && g_i4s<=1
 #ifdef COLI_CUDA
            && !g_cuda_enabled
 #endif
@@ -3416,7 +3450,70 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                 }
             }
         }
-        if(!metal_done && !xexp_done)
+#ifdef COLI_VULKAN
+        /* Vulkan expert tier (COLI_VULKAN=1): upload routed int4 experts to the GPU once
+         * (capped by COLI_VK_EXPERTS), then compute the resident ones as one batched
+         * coli_vk_expert_group (fused gate+up+silu -> down, on-device); the rest + misses
+         * fall back to the CPU below. Decode-only (S<=4). Measured ~35% faster than ROCm. */
+        if(vk_active && !metal_done){
+            ColiVkTensor *vg[64],*vu[64],*vd[64]; ESlot *ve[64]; int vrows[64], voff[64], vrmap[64*4]; float vwmap[64*4];
+            ESlot *ce[64]; int cnr[64], crmap[64*4]; float cwmap[64*4];
+            int nvk=0, vtot=0, ncpu=0;
+            double t0=now_s();
+            for(int j=0;j<nb;j++){ int eid=uniq[base+j]; ESlot *e=use[j];
+                if(g_pipe && qof[j]>=0){ double tw=now_s(); pipe_wait(qof[j]); m->t_ewait += now_s()-tw; }
+                int nr=0;
+                for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++)
+                    if(idxs[(int64_t)s*K+kk]==eid){ rows[nr]=s; rw[nr]=ws[(int64_t)s*K+kk]; nr++; break; }
+                if(!nr) continue;
+                if(!e->slab) expert_load(m,layer,e->eid,e,1);
+                int elig = e->slab && e->g.fmt==2 && e->u.fmt==2 && e->d.fmt==2 && nvk<64 && (vtot+nr)<=S*K;
+                if(elig && !e->g.vk_eligible && g_vk_resident < g_vk_budget
+                   && (uint8_t*)e->g.q4>=e->slab && (uint8_t*)e->d.q4>=e->slab){
+                    if(coli_vk_tensor_ensure(&e->g.vk,e->g.q4,e->g.s,2,D,I)
+                       && coli_vk_tensor_ensure(&e->u.vk,e->u.q4,e->u.s,2,D,I)
+                       && coli_vk_tensor_ensure(&e->d.vk,e->d.q4,e->d.s,2,I,D)){
+                        e->g.vk_eligible=e->u.vk_eligible=e->d.vk_eligible=1; g_vk_resident++;
+                    }
+                }
+                if(elig && e->g.vk_eligible){
+                    voff[nvk]=vtot;
+                    for(int r=0;r<nr;r++){ memcpy(vk_xh+(int64_t)(vtot+r)*D, x+(int64_t)rows[r]*D, D*sizeof(float));
+                        vrmap[nvk*S+r]=rows[r]; vwmap[nvk*S+r]=rw[r]; }
+                    vg[nvk]=e->g.vk; vu[nvk]=e->u.vk; vd[nvk]=e->d.vk; ve[nvk]=e; vrows[nvk]=nr; vtot+=nr; nvk++;
+                } else {
+                    ce[ncpu]=e; cnr[ncpu]=nr;
+                    for(int r=0;r<nr;r++){ crmap[ncpu*S+r]=rows[r]; cwmap[ncpu*S+r]=rw[r]; }
+                    ncpu++;
+                }
+            }
+            int vk_ok = nvk>0 && coli_vk_expert_group(vg,vu,vd,vrows,nvk,vk_yh,vk_xh);
+            for(int c=0;c<ncpu;c++){ ESlot *e=ce[c]; int nr=cnr[c];
+                for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D, x+(int64_t)crmap[c*S+r]*D, D*sizeof(float));
+                expert_gate_up(gg,uu,xg,&e->g,&e->u,nr);
+                for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
+                matmul_qt(hh, gg, &e->d, nr);
+                for(int r=0;r<nr;r++){ float *os=out+(int64_t)crmap[c*S+r]*D, wgt=cwmap[c*S+r], *hr=hh+(int64_t)r*D;
+                    for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
+            }
+            for(int c=0;c<nvk;c++){ int nr=vrows[c];
+                if(vk_ok){ int o=voff[c];
+                    for(int r=0;r<nr;r++){ float *os=out+(int64_t)vrmap[c*S+r]*D, wgt=vwmap[c*S+r], *src=vk_yh+(int64_t)(o+r)*D;
+                        for(int d=0;d<D;d++) os[d]+=wgt*src[d]; }
+                } else {   /* group failed: recompute this expert's rows on the CPU via its ESlot */
+                    ESlot *e=ve[c];
+                    for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D, x+(int64_t)vrmap[c*S+r]*D, D*sizeof(float));
+                    expert_gate_up(gg,uu,xg,&e->g,&e->u,nr);
+                    for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
+                    matmul_qt(hh, gg, &e->d, nr);
+                    for(int r=0;r<nr;r++){ float *os=out+(int64_t)vrmap[c*S+r]*D, wgt=vwmap[c*S+r], *hr=hh+(int64_t)r*D;
+                        for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
+                }
+            }
+            double dt=now_s()-t0; m->t_emm+=dt; if(g_prof) m->t_egpu+=dt;
+        }
+#endif
+        if(!metal_done && !xexp_done && !vk_active)
         for(int j=0;j<nb;j++){ int eid=uniq[base+j]; ESlot *e=use[j];
 #ifdef COLI_CUDA
             if(early_issued && done_j[j]) continue;    /* computing on the GPU right now */
@@ -3657,6 +3754,9 @@ shared_done:
 #ifdef COLI_CUDA
     free(group_x);free(group_y);
     free(group_row); free(group_weight);
+#endif
+#ifdef COLI_VULKAN
+    free(vk_xh); free(vk_yh);
 #endif
 }
 
@@ -6770,6 +6870,17 @@ int main(int argc, char **argv){
         if(!g_cuda_enabled){ fprintf(stderr,"[CUDA] requested backend is unavailable\n"); return 2; }
     }
     g_cuda_dense=getenv("CUDA_DENSE")?atoi(getenv("CUDA_DENSE")):0;
+#endif
+#ifdef COLI_VULKAN
+    if(getenv("COLI_VULKAN") && atoi(getenv("COLI_VULKAN"))){
+        const char *spv = getenv("COLI_VK_SHADERS"); if(!spv) spv = "shaders/qmatmul.spv";
+        g_vulkan = coli_vk_init(spv);
+        if(!g_vulkan){ fprintf(stderr,"[VK] Vulkan backend unavailable (need libvulkan + shaders/qmatmul{,_gate_up}.spv)\n"); return 2; }
+        g_vk_budget = getenv("COLI_VK_EXPERTS") ? atoi(getenv("COLI_VK_EXPERTS")) : 1024;
+        fprintf(stderr,"[VK] expert tier active: routed int4 experts on the GPU (budget %d)\n", g_vk_budget);
+    }
+#endif
+#ifdef COLI_CUDA
     g_cuda_pipe=getenv("COLI_CUDA_PIPE")?atoi(getenv("COLI_CUDA_PIPE")):0;
     g_cuda_router=getenv("COLI_CUDA_ROUTER")?atoi(getenv("COLI_CUDA_ROUTER")):0;
     g_cuda_resid=getenv("COLI_CUDA_RESID")?atoi(getenv("COLI_CUDA_RESID")):0;
