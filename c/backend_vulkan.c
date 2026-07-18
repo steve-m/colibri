@@ -45,6 +45,13 @@ static struct {
     VkCommandBuffer cmd;
     VkFence fence;
     Scratch x, y;
+    /* resubmit cache: skip vkUpdateDescriptorSets + command re-record when the bound
+     * tensor / shape / scratch buffers are unchanged from the previous call (the hot-
+     * expert-called-repeatedly pattern). The synchronous fence wait each call means no
+     * submission is ever in flight, so rebinding/re-recording only when something
+     * actually changed is safe. */
+    ColiVkTensor *bound_tensor; int bound_S, bound_I, bound_O, cmd_ready;
+    VkBuffer bound_xbuf, bound_ybuf;
     size_t used_bytes, tensor_count;
 } G;
 
@@ -249,31 +256,46 @@ int coli_vk_matmul(ColiVkTensor **tensor, float *y, const float *x,
     if (!G.ready || S < 1 || !upload_tensor(tensor, weights, scales, fmt, I, O)) return 0;
     ColiVkTensor *t = *tensor;
     size_t xb = (size_t)S * I * sizeof(float), yb = (size_t)S * O * sizeof(float);
+    VkBuffer old_x = G.x.buf, old_y = G.y.buf;
     if (!scratch_reserve(&G.x, xb) || !scratch_reserve(&G.y, yb)) return 0;
     memcpy(G.x.ptr, x, xb);
 
-    VkDescriptorBufferInfo bi[4] = {
-        {.buffer = G.x.buf, .range = VK_WHOLE_SIZE},
-        {.buffer = t->wbuf, .range = VK_WHOLE_SIZE},
-        {.buffer = t->sbuf, .range = VK_WHOLE_SIZE},
-        {.buffer = G.y.buf, .range = VK_WHOLE_SIZE}};
-    VkWriteDescriptorSet w[4];
-    for (int i = 0; i < 4; i++) w[i] = (VkWriteDescriptorSet){
-        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = G.dset,
-        .dstBinding = i, .descriptorCount = 1,
-        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi[i]};
-    vkUpdateDescriptorSets(G.dev, 4, w, 0, NULL);
+    /* Rebind descriptors only when the tensor or a scratch buffer changed (a realloc
+     * makes the old VkBuffer handle stale); otherwise the previous binding is still valid. */
+    int rebind = G.bound_tensor != t || G.x.buf != old_x || G.y.buf != old_y
+              || G.bound_xbuf != G.x.buf || G.bound_ybuf != G.y.buf;
+    if (rebind) {
+        VkDescriptorBufferInfo bi[4] = {
+            {.buffer = G.x.buf, .range = VK_WHOLE_SIZE},
+            {.buffer = t->wbuf, .range = VK_WHOLE_SIZE},
+            {.buffer = t->sbuf, .range = VK_WHOLE_SIZE},
+            {.buffer = G.y.buf, .range = VK_WHOLE_SIZE}};
+        VkWriteDescriptorSet w[4];
+        for (int i = 0; i < 4; i++) w[i] = (VkWriteDescriptorSet){
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = G.dset,
+            .dstBinding = i, .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi[i]};
+        vkUpdateDescriptorSets(G.dev, 4, w, 0, NULL);
+        G.bound_tensor = t; G.bound_xbuf = G.x.buf; G.bound_ybuf = G.y.buf;
+    }
 
-    VKCHECK(vkResetCommandBuffer(G.cmd, 0), "resetCmd");
-    VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
-    VKCHECK(vkBeginCommandBuffer(G.cmd, &begin), "beginCmd");
-    vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe);
-    vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt, 0, 1, &G.dset, 0, NULL);
-    struct PC pc = {fmt, S, I, O, t->rowWords};
-    vkCmdPushConstants(G.cmd, G.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-    vkCmdDispatch(G.cmd, (uint32_t)O, (uint32_t)S, 1);
-    VKCHECK(vkEndCommandBuffer(G.cmd), "endCmd");
+    /* Re-record the command buffer only when the binding or the dispatch shape changed.
+     * Recorded WITHOUT one-time-submit so the same buffer can be resubmitted verbatim —
+     * for repeated calls to the same expert this drops setup to a bare submit+wait. */
+    if (rebind || !G.cmd_ready || G.bound_S != S || G.bound_I != I || G.bound_O != O) {
+        VKCHECK(vkResetCommandBuffer(G.cmd, 0), "resetCmd");
+        VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        VKCHECK(vkBeginCommandBuffer(G.cmd, &begin), "beginCmd");
+        vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe);
+        vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt, 0, 1, &G.dset, 0, NULL);
+        struct PC pc = {fmt, S, I, O, t->rowWords};
+        vkCmdPushConstants(G.cmd, G.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+        /* Grid-stride shader: one subgroup per output row (~8 rows/workgroup at wave32).
+         * Launch ~O/8 workgroups for occupancy; the shader loops to cover any O / wave width. */
+        vkCmdDispatch(G.cmd, (uint32_t)((O + 7) / 8), (uint32_t)S, 1);
+        VKCHECK(vkEndCommandBuffer(G.cmd), "endCmd");
+        G.cmd_ready = 1; G.bound_S = S; G.bound_I = I; G.bound_O = O;
+    }
 
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
         .commandBufferCount = 1, .pCommandBuffers = &G.cmd};
@@ -294,6 +316,7 @@ int coli_vk_matmul(ColiVkTensor **tensor, float *y, const float *x,
 
 void coli_vk_tensor_free(ColiVkTensor *t) {
     if (!t) return;
+    if (G.bound_tensor == t) { G.bound_tensor = NULL; G.cmd_ready = 0; }  /* drop stale cache */
     // If the device was lost/disabled (the fence-timeout path sets G.ready=0), a submission
     // may still reference these buffers — do NOT vkDestroy into a dead device (GPU-side UAF).
     // Leak the GPU handles (we're degrading to CPU for the rest of the run) and reclaim the
@@ -383,6 +406,42 @@ static int run_case(int fmt, int S, int I, int O, int iters) {
     return maxrel > 1e-3 ? 1 : 0;
 }
 
+/* Batched throughput: record N dispatches in ONE command buffer, one submit + one
+ * fence wait — the amortized per-matmul cost with the submit roundtrip spread across
+ * the batch (how the real expert tier would drive it). Reuses the descriptor binding
+ * left by a prior coli_vk_matmul call for this tensor/shape. */
+static double bench_batched(ColiVkTensor *t, const float *x, int fmt, int S, int I, int O, int N) {
+    size_t xb = (size_t)S * I * sizeof(float);
+    memcpy(G.x.ptr, x, xb);
+    vkResetCommandBuffer(G.cmd, 0);
+    VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    vkBeginCommandBuffer(G.cmd, &begin);
+    vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe);
+    vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt, 0, 1, &G.dset, 0, NULL);
+    struct PC pc = {fmt, S, I, O, t->rowWords};
+    vkCmdPushConstants(G.cmd, G.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+    VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT};
+    for (int i = 0; i < N; i++) {
+        vkCmdDispatch(G.cmd, (uint32_t)((O + 7) / 8), (uint32_t)S, 1);
+        vkCmdPipelineBarrier(G.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+    }
+    vkEndCommandBuffer(G.cmd);
+    VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd};
+    for (int warm = 0; warm < 2; warm++) {
+        vkResetFences(G.dev, 1, &G.fence); vkQueueSubmit(G.queue, 1, &si, G.fence);
+        vkWaitForFences(G.dev, 1, &G.fence, VK_TRUE, 10000000000ULL);
+    }
+    int iters = 10; double t0 = now();
+    for (int k = 0; k < iters; k++) {
+        vkResetFences(G.dev, 1, &G.fence); vkQueueSubmit(G.queue, 1, &si, G.fence);
+        vkWaitForFences(G.dev, 1, &G.fence, VK_TRUE, 10000000000ULL);
+    }
+    G.cmd_ready = 0;   /* we clobbered the cached command buffer */
+    return (now() - t0) * 1000.0 / iters / N;   /* ms per matmul, roundtrip amortized */
+}
+
 int main(int argc, char **argv) {
     const char *spv = argc > 1 ? argv[1] : "shaders/qmatmul.spv";
     if (!coli_vk_init(spv)) { printf("vk init failed\n"); return 1; }
@@ -393,6 +452,29 @@ int main(int argc, char **argv) {
     bad |= run_case(1, 1, 1536, 6144, 50);   // down proj shape
     bad |= run_case(2, 8, 6144, 1536, 20);   // prefill/MTP batch
     bad |= run_case(1, 1, 512, 512, 100);    // small
+    /* Batched (amortized) throughput on the int4 expert shapes — the real expert-tier pattern. */
+    {
+        int I = 6144, O = 2048;   /* our gate/up dims */
+        float *x = malloc((size_t)I * 4); uint8_t *w = malloc((size_t)(I + 1) / 2 * O); float *sc = malloc((size_t)O * 4);
+        for (int i = 0; i < I; i++) x[i] = (rand() % 200 - 100) / 100.0f;
+        for (size_t i = 0; i < (size_t)(I + 1) / 2 * O; i++) w[i] = rand() & 0xff;
+        for (int o = 0; o < O; o++) sc[o] = 0.01f + (rand() % 100) / 10000.0f;
+        float *y = malloc((size_t)O * 4);
+        ColiVkTensor *t = NULL; coli_vk_matmul(&t, y, x, w, sc, 2, 1, I, O);   /* bind */
+        printf("BATCHED int4 S=1 6144->2048 (our gate/up): %.4f ms/matmul (N=64, one submit)\n",
+               bench_batched(t, x, 2, 1, I, O, 64));
+        coli_vk_tensor_free(t); free(x); free(w); free(sc); free(y);
+        I = 2048; O = 6144;   /* our down dims */
+        x = malloc((size_t)I * 4); w = malloc((size_t)(I + 1) / 2 * O); sc = malloc((size_t)O * 4);
+        for (int i = 0; i < I; i++) x[i] = (rand() % 200 - 100) / 100.0f;
+        for (size_t i = 0; i < (size_t)(I + 1) / 2 * O; i++) w[i] = rand() & 0xff;
+        for (int o = 0; o < O; o++) sc[o] = 0.01f + (rand() % 100) / 10000.0f;
+        y = malloc((size_t)O * 4);
+        t = NULL; coli_vk_matmul(&t, y, x, w, sc, 2, 1, I, O);
+        printf("BATCHED int4 S=1 2048->6144 (our down):    %.4f ms/matmul (N=64, one submit)\n",
+               bench_batched(t, x, 2, 1, I, O, 64));
+        coli_vk_tensor_free(t); free(x); free(w); free(sc); free(y);
+    }
     printf(bad ? "FAIL\n" : "PASS\n");
     coli_vk_shutdown();
     return bad;
