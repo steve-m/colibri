@@ -256,6 +256,23 @@ LDFLAGS  += -framework Metal -framework Foundation -lc++
 METAL_OBJ = backend_metal.o
 endif
 
+# VK=1 adds an opt-in Vulkan compute backend (any Vulkan 1.2 driver, e.g. Mesa/RADV)
+# for resident expert tensors. Independent of CUDA/HIP: works on GPUs ROCm doesn't
+# support (Polaris/RX 580) and measured ~35% faster than ROCm on RDNA4 for int4 experts.
+# Needs libvulkan + glslc (shaderc). Default build unchanged (all colibri.c hooks under
+# #ifdef COLI_VULKAN). The .comp shaders compile to .spv, loaded at runtime from
+# COLI_VK_SHADERS (default: alongside the binary / ./shaders).
+VK        ?= 0
+VK_OBJ     =
+VK_SPV     =
+GLSLC     ?= glslc
+ifeq ($(VK),1)
+CFLAGS   += -DCOLI_VULKAN
+LDFLAGS  += -lvulkan
+VK_OBJ    = backend_vulkan.o
+VK_SPV    = shaders/qmatmul.spv shaders/qmatmul_gate_up.spv
+endif
+
 all: colibri$(EXE)
 
 # phony targets — 'glm' kept for backward compatibility
@@ -269,7 +286,7 @@ glm: colibri$(EXE)
 # rewrite it ONLY when they change (evaluated here at parse time, so the file's
 # timestamp moves exactly when the config moves). The binary and CUDA/loader objects depend
 # on it, so they relink on a config change and stay put otherwise. (#306)
-BUILD_CONFIG     := $(CC)|$(CFLAGS)|$(LDFLAGS)|CUDA=$(CUDA)|CUDA_DLL=$(CUDA_DLL)|ARCH=$(ARCH)|CUDA_ARCH=$(CUDA_ARCH)|METAL=$(METAL)|HIP=$(HIP)|HIP_ARCH=$(HIP_ARCH)
+BUILD_CONFIG     := $(CC)|$(CFLAGS)|$(LDFLAGS)|CUDA=$(CUDA)|CUDA_DLL=$(CUDA_DLL)|ARCH=$(ARCH)|CUDA_ARCH=$(CUDA_ARCH)|METAL=$(METAL)|HIP=$(HIP)|HIP_ARCH=$(HIP_ARCH)|VK=$(VK)
 BUILD_CONFIG_OLD := $(shell cat .build-config 2>/dev/null)
 ifneq "$(BUILD_CONFIG)" "$(BUILD_CONFIG_OLD)"
 # $(file ...) writes via make's own primitive (GNU Make >= 4.0, 2013), NOT by
@@ -282,8 +299,15 @@ $(file >.build-config,$(BUILD_CONFIG))
 endif
 .build-config: ;
 
-colibri$(EXE): colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h quant.h sample.h kv_persist.h telemetry.h $(CUDA_OBJ) $(METAL_OBJ) .build-config
-	$(CC) $(CFLAGS) colibri.c $(CUDA_OBJ) $(METAL_OBJ) -o colibri$(EXE) $(LDFLAGS)
+colibri$(EXE): colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h quant.h sample.h kv_persist.h telemetry.h $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
+	$(CC) $(CFLAGS) colibri.c $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) -o colibri$(EXE) $(LDFLAGS)
+
+# Vulkan backend object (plain C + vulkan headers) and its SPIR-V shaders.
+backend_vulkan.o: backend_vulkan.c backend_vulkan.h .build-config
+	$(CC) $(CFLAGS) -c backend_vulkan.c -o $@
+shaders/%.spv: shaders/%.comp
+	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
+	$(GLSLC) --target-env=vulkan1.2 $< -o $@
 
 # Windows runtime loader object: resolves coli_cuda_* from coli_cuda.dll.
 backend_loader.o: backend_loader.c backend_cuda.h compat.h .build-config
