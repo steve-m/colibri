@@ -30,6 +30,16 @@ int  coli_vk_matmul(ColiVkTensor **tensor,
                     const void *weights, const float *scales,
                     int fmt, int S, int I, int O);
 
+/* Fused first half of the expert MLP in ONE dispatch (VK equivalent of
+ * grouped_hidden_w4_dual): hidden[s,o] = silu(gate(x)) * up(x), reading x once for both
+ * projections. D = input (hidden) dim, I = moe_inter. gate/up upload on first call.
+ * Returns 0 if unavailable (no gate_up shader) / unsupported fmt so the caller falls back. */
+int  coli_vk_gate_up(ColiVkTensor **gate, ColiVkTensor **up,
+                     float *hidden, const float *x,
+                     const void *gw, const float *gs,
+                     const void *uw, const float *us,
+                     int fmt, int S, int D, int I);
+
 void   coli_vk_tensor_free(ColiVkTensor *t);
 size_t coli_vk_tensor_bytes(const ColiVkTensor *t);
 

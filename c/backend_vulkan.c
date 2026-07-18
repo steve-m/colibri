@@ -41,10 +41,13 @@ static struct {
     VkShaderModule shader;
     VkDescriptorPool dpool;
     VkDescriptorSet dset;
+    /* fused dual gate+up+silu pipeline (6 bindings): x, Wg, gscale, Wu, uscale, hidden */
+    VkShaderModule shader_gu; VkDescriptorSetLayout dsl_gu; VkPipelineLayout plyt_gu;
+    VkPipeline pipe_gu; VkDescriptorPool dpool_gu; VkDescriptorSet dset_gu;
     VkCommandPool cpool;
     VkCommandBuffer cmd;
     VkFence fence;
-    Scratch x, y;
+    Scratch x, y, h;   /* h = fused gate+up hidden output */
     /* resubmit cache: skip vkUpdateDescriptorSets + command re-record when the bound
      * tensor / shape / scratch buffers are unchanged from the previous call (the hot-
      * expert-called-repeatedly pattern). The synchronous fence wait each call means no
@@ -119,6 +122,46 @@ static VkShaderModule load_spv(const char *path) {
     return r == VK_SUCCESS ? m : VK_NULL_HANDLE;
 }
 
+/* Build a compute pipeline + descriptor pool/set for nbind storage buffers sharing the
+ * struct PC push constant. Used for both the 4-binding matmul and 6-binding gate_up. */
+static int build_pipeline(int nbind, VkShaderModule shader, VkDescriptorSetLayout *dsl,
+                          VkPipelineLayout *plyt, VkPipeline *pipe, VkDescriptorPool *dpool,
+                          VkDescriptorSet *dset) {
+    VkDescriptorSetLayoutBinding b[8];
+    for (int i = 0; i < nbind; i++) b[i] = (VkDescriptorSetLayoutBinding){
+        .binding = (uint32_t)i, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+        .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT};
+    VkDescriptorSetLayoutCreateInfo dsli = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount = (uint32_t)nbind, .pBindings = b};
+    VKCHECK(vkCreateDescriptorSetLayout(G.dev, &dsli, NULL, dsl), "descSetLayout");
+    VkPushConstantRange pcr = {.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT, .offset = 0, .size = sizeof(struct PC)};
+    VkPipelineLayoutCreateInfo pli = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount = 1, .pSetLayouts = dsl, .pushConstantRangeCount = 1, .pPushConstantRanges = &pcr};
+    VKCHECK(vkCreatePipelineLayout(G.dev, &pli, NULL, plyt), "pipelineLayout");
+    VkComputePipelineCreateInfo cpi = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                  .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = shader, .pName = "main"},
+        .layout = *plyt};
+    VKCHECK(vkCreateComputePipelines(G.dev, VK_NULL_HANDLE, 1, &cpi, NULL, pipe), "pipeline");
+    VkDescriptorPoolSize ps = {.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = (uint32_t)nbind};
+    VkDescriptorPoolCreateInfo dpi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .maxSets = 1, .poolSizeCount = 1, .pPoolSizes = &ps};
+    VKCHECK(vkCreateDescriptorPool(G.dev, &dpi, NULL, dpool), "descPool");
+    VkDescriptorSetAllocateInfo dsa = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool = *dpool, .descriptorSetCount = 1, .pSetLayouts = dsl};
+    VKCHECK(vkAllocateDescriptorSets(G.dev, &dsa, dset), "allocDescSet");
+    return 1;
+}
+
+/* "…/qmatmul.spv" -> "…/qmatmul_gate_up.spv" (sibling of the main shader). */
+static void derive_gu_path(const char *spv, char *out, size_t n) {
+    const char *dot = strstr(spv, ".spv");
+    if (dot && (size_t)(dot - spv) + 13 < n) {
+        size_t pre = (size_t)(dot - spv);
+        memcpy(out, spv, pre); strcpy(out + pre, "_gate_up.spv");
+    } else snprintf(out, n, "%s", spv);
+}
+
 int coli_vk_init(const char *spv_path) {
     if (G.ready) return 1;
     VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
@@ -168,36 +211,14 @@ int coli_vk_init(const char *spv_path) {
 
     G.shader = load_spv(spv_path);
     if (!G.shader) return 0;
+    if (!build_pipeline(4, G.shader, &G.dsl, &G.plyt, &G.pipe, &G.dpool, &G.dset)) return 0;
 
-    VkDescriptorSetLayoutBinding b[4];
-    for (int i = 0; i < 4; i++) b[i] = (VkDescriptorSetLayoutBinding){
-        .binding = i, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-        .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT};
-    VkDescriptorSetLayoutCreateInfo dsli = {
-        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-        .bindingCount = 4, .pBindings = b};
-    VKCHECK(vkCreateDescriptorSetLayout(G.dev, &dsli, NULL, &G.dsl), "descSetLayout");
-
-    VkPushConstantRange pcr = {.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
-        .offset = 0, .size = sizeof(struct PC)};
-    VkPipelineLayoutCreateInfo pli = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-        .setLayoutCount = 1, .pSetLayouts = &G.dsl,
-        .pushConstantRangeCount = 1, .pPushConstantRanges = &pcr};
-    VKCHECK(vkCreatePipelineLayout(G.dev, &pli, NULL, &G.plyt), "pipelineLayout");
-
-    VkComputePipelineCreateInfo cpi = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-        .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-                  .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = G.shader, .pName = "main"},
-        .layout = G.plyt};
-    VKCHECK(vkCreateComputePipelines(G.dev, VK_NULL_HANDLE, 1, &cpi, NULL, &G.pipe), "pipeline");
-
-    VkDescriptorPoolSize ps = {.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 4};
-    VkDescriptorPoolCreateInfo dpi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-        .maxSets = 1, .poolSizeCount = 1, .pPoolSizes = &ps};
-    VKCHECK(vkCreateDescriptorPool(G.dev, &dpi, NULL, &G.dpool), "descPool");
-    VkDescriptorSetAllocateInfo dsa = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-        .descriptorPool = G.dpool, .descriptorSetCount = 1, .pSetLayouts = &G.dsl};
-    VKCHECK(vkAllocateDescriptorSets(G.dev, &dsa, &G.dset), "allocDescSet");
+    /* Optional fused gate+up pipeline: skip gracefully if its shader isn't present
+     * (single-matmul path keeps working). */
+    char gu_path[512]; derive_gu_path(spv_path, gu_path, sizeof(gu_path));
+    G.shader_gu = load_spv(gu_path);
+    if (G.shader_gu && !build_pipeline(6, G.shader_gu, &G.dsl_gu, &G.plyt_gu, &G.pipe_gu, &G.dpool_gu, &G.dset_gu))
+        return 0;
 
     VkCommandPoolCreateInfo cpci = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
         .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = G.qfam};
@@ -210,7 +231,8 @@ int coli_vk_init(const char *spv_path) {
 
     G.ready = 1;
     VkPhysicalDeviceProperties p; vkGetPhysicalDeviceProperties(G.phys, &p);
-    fprintf(stderr, "[VK] ready: %s, compute qfam %u, memtype %u\n", p.deviceName, G.qfam, G.memtype);
+    fprintf(stderr, "[VK] ready: %s, compute qfam %u, memtype %u%s\n", p.deviceName, G.qfam, G.memtype,
+            G.shader_gu ? ", fused gate+up" : "");
     return 1;
 }
 
@@ -314,6 +336,49 @@ int coli_vk_matmul(ColiVkTensor **tensor, float *y, const float *x,
     return 1;
 }
 
+/* Fused first half of the expert MLP: hidden = silu(gate(x)) * up(x), computed in ONE
+ * dispatch that reads x once for both projections. gate/up are resident (uploaded on
+ * first call). D = input (hidden) dim, I = moe_inter. Returns 0 -> caller falls back. */
+int coli_vk_gate_up(ColiVkTensor **gate, ColiVkTensor **up, float *hidden, const float *x,
+                    const void *gw, const float *gs, const void *uw, const float *us,
+                    int fmt, int S, int D, int I) {
+    if (!G.ready || !G.shader_gu || S < 1) return 0;
+    if (!upload_tensor(gate, gw, gs, fmt, D, I) || !upload_tensor(up, uw, us, fmt, D, I)) return 0;
+    ColiVkTensor *tg = *gate, *tu = *up;
+    size_t xb = (size_t)S * D * sizeof(float), hb = (size_t)S * I * sizeof(float);
+    if (!scratch_reserve(&G.x, xb) || !scratch_reserve(&G.h, hb)) return 0;
+    memcpy(G.x.ptr, x, xb);
+
+    VkDescriptorBufferInfo bi[6] = {
+        {.buffer = G.x.buf, .range = VK_WHOLE_SIZE}, {.buffer = tg->wbuf, .range = VK_WHOLE_SIZE},
+        {.buffer = tg->sbuf, .range = VK_WHOLE_SIZE}, {.buffer = tu->wbuf, .range = VK_WHOLE_SIZE},
+        {.buffer = tu->sbuf, .range = VK_WHOLE_SIZE}, {.buffer = G.h.buf, .range = VK_WHOLE_SIZE}};
+    VkWriteDescriptorSet w[6];
+    for (int i = 0; i < 6; i++) w[i] = (VkWriteDescriptorSet){
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = G.dset_gu,
+        .dstBinding = (uint32_t)i, .descriptorCount = 1,
+        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi[i]};
+    vkUpdateDescriptorSets(G.dev, 6, w, 0, NULL);
+
+    VKCHECK(vkResetCommandBuffer(G.cmd, 0), "resetCmd");
+    VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    VKCHECK(vkBeginCommandBuffer(G.cmd, &begin), "beginCmd");
+    vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_gu);
+    vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_gu, 0, 1, &G.dset_gu, 0, NULL);
+    struct PC pc = {fmt, S, D, I, tg->rowWords};   // PC.I = input D, PC.O = moe_inter I
+    vkCmdPushConstants(G.cmd, G.plyt_gu, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+    vkCmdDispatch(G.cmd, (uint32_t)((I + 7) / 8), (uint32_t)S, 1);
+    VKCHECK(vkEndCommandBuffer(G.cmd), "endCmd");
+
+    VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd};
+    VKCHECK(vkResetFences(G.dev, 1, &G.fence), "resetFence");
+    VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.fence), "queueSubmit");
+    if (vkWaitForFences(G.dev, 1, &G.fence, VK_TRUE, 10000000000ULL) != VK_SUCCESS) { G.ready = 0; return 0; }
+    memcpy(hidden, G.h.ptr, hb);
+    G.cmd_ready = 0; G.bound_tensor = NULL;   /* the shared command buffer/binding was clobbered */
+    return 1;
+}
+
 void coli_vk_tensor_free(ColiVkTensor *t) {
     if (!t) return;
     if (G.bound_tensor == t) { G.bound_tensor = NULL; G.cmd_ready = 0; }  /* drop stale cache */
@@ -339,6 +404,7 @@ void coli_vk_shutdown(void) {
     vkDeviceWaitIdle(G.dev);
     if (G.x.buf) { vkDestroyBuffer(G.dev, G.x.buf, NULL); vkFreeMemory(G.dev, G.x.mem, NULL); }
     if (G.y.buf) { vkDestroyBuffer(G.dev, G.y.buf, NULL); vkFreeMemory(G.dev, G.y.mem, NULL); }
+    if (G.h.buf) { vkDestroyBuffer(G.dev, G.h.buf, NULL); vkFreeMemory(G.dev, G.h.mem, NULL); }
     vkDestroyFence(G.dev, G.fence, NULL);
     vkDestroyCommandPool(G.dev, G.cpool, NULL);
     vkDestroyDescriptorPool(G.dev, G.dpool, NULL);
@@ -346,6 +412,13 @@ void coli_vk_shutdown(void) {
     vkDestroyPipelineLayout(G.dev, G.plyt, NULL);
     vkDestroyDescriptorSetLayout(G.dev, G.dsl, NULL);
     vkDestroyShaderModule(G.dev, G.shader, NULL);
+    if (G.shader_gu) {
+        vkDestroyDescriptorPool(G.dev, G.dpool_gu, NULL);
+        vkDestroyPipeline(G.dev, G.pipe_gu, NULL);
+        vkDestroyPipelineLayout(G.dev, G.plyt_gu, NULL);
+        vkDestroyDescriptorSetLayout(G.dev, G.dsl_gu, NULL);
+        vkDestroyShaderModule(G.dev, G.shader_gu, NULL);
+    }
     vkDestroyDevice(G.dev, NULL);
     vkDestroyInstance(G.inst, NULL);
     memset(&G, 0, sizeof(G));
@@ -442,6 +515,107 @@ static double bench_batched(ColiVkTensor *t, const float *x, int fmt, int S, int
     return (now() - t0) * 1000.0 / iters / N;   /* ms per matmul, roundtrip amortized */
 }
 
+/* Fused gate+up correctness vs CPU ref: hidden = silu(gate*x)*(up*x). */
+static int run_gate_up(int fmt, int S, int D, int I) {
+    size_t rb = fmt == 1 ? (size_t)D : (size_t)(D + 1) / 2;
+    float *x = malloc((size_t)S*D*4); uint8_t *gw = malloc(rb*I), *uw = malloc(rb*I);
+    float *gs = malloc((size_t)I*4), *us = malloc((size_t)I*4);
+    float *hg = malloc((size_t)S*I*4), *hc = malloc((size_t)S*I*4);
+    for (int i = 0; i < S*D; i++) x[i] = (rand()%200-100)/100.0f;
+    for (size_t i = 0; i < rb*I; i++) { gw[i] = rand()&0xff; uw[i] = rand()&0xff; }
+    for (int o = 0; o < I; o++) { gs[o] = 0.01f+(rand()%100)/10000.0f; us[o] = 0.01f+(rand()%100)/10000.0f; }
+    ColiVkTensor *tg = NULL, *tu = NULL;
+    if (!coli_vk_gate_up(&tg, &tu, hg, x, gw, gs, uw, us, fmt, S, D, I)) { printf("gate_up failed\n"); return 1; }
+    for (int s = 0; s < S; s++) for (int o = 0; o < I; o++) {
+        double g = 0, u = 0; const uint8_t *gr = gw+(size_t)o*rb, *ur = uw+(size_t)o*rb;
+        for (int i = 0; i < D; i++) { g += x[s*D+i]*deq(gr,fmt,i); u += x[s*D+i]*deq(ur,fmt,i); }
+        float gt = (float)(g*gs[o]), ut = (float)(u*us[o]);
+        hc[s*I+o] = (gt/(1.0f+expf(-gt)))*ut;
+    }
+    double maxrel = 0;
+    for (int i = 0; i < S*I; i++) { double e = fabs(hg[i]-hc[i]); if (fabs(hc[i])>1e-2) { double r = e/fabs(hc[i]); if (r>maxrel) maxrel = r; } }
+    printf("gate_up(fused) fmt=%d S=%d D=%d I=%d | maxrel=%.4g\n", fmt, S, D, I, maxrel);
+    coli_vk_tensor_free(tg); coli_vk_tensor_free(tu);
+    free(x); free(gw); free(uw); free(gs); free(us); free(hg); free(hc);
+    return maxrel > 1e-3 ? 1 : 0;
+}
+
+/* Batched throughput of the fused gate_up (N dispatches / one submit). */
+static double bench_gu_batched(ColiVkTensor *tg, const float *x, int fmt, int S, int D, int I, int N) {
+    memcpy(G.x.ptr, x, (size_t)S*D*sizeof(float));
+    vkResetCommandBuffer(G.cmd, 0);
+    VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    vkBeginCommandBuffer(G.cmd, &begin);
+    vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_gu);
+    vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_gu, 0, 1, &G.dset_gu, 0, NULL);
+    struct PC pc = {fmt, S, D, I, tg->rowWords};
+    vkCmdPushConstants(G.cmd, G.plyt_gu, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+    VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT};
+    for (int i = 0; i < N; i++) {
+        vkCmdDispatch(G.cmd, (uint32_t)((I+7)/8), (uint32_t)S, 1);
+        vkCmdPipelineBarrier(G.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+    }
+    vkEndCommandBuffer(G.cmd);
+    VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd};
+    for (int w = 0; w < 2; w++) { vkResetFences(G.dev,1,&G.fence); vkQueueSubmit(G.queue,1,&si,G.fence); vkWaitForFences(G.dev,1,&G.fence,VK_TRUE,10000000000ULL); }
+    int iters = 10; double t0 = now();
+    for (int k = 0; k < iters; k++) { vkResetFences(G.dev,1,&G.fence); vkQueueSubmit(G.queue,1,&si,G.fence); vkWaitForFences(G.dev,1,&G.fence,VK_TRUE,10000000000ULL); }
+    return (now()-t0)*1000.0/iters/N;
+}
+
+/* FAIR fused-gate_up throughput: cycle K DISTINCT experts (own descriptor set each) so
+ * weights come from VRAM, not L2 — matching ROCm's expert_group reading distinct experts.
+ * Returns ms per gate_up (one expert). */
+static double bench_experts_fair(int fmt, int D, int I, int K, int Npass) {
+    if (K > 32) K = 32;
+    size_t rb = fmt == 1 ? (size_t)D : (size_t)(D + 1) / 2;
+    ColiVkTensor *tg[32] = {0}, *tu[32] = {0};
+    float *h = malloc((size_t)I*4), *x = malloc((size_t)D*4);
+    for (int i = 0; i < D; i++) x[i] = (rand()%200-100)/100.0f;
+    for (int c = 0; c < K; c++) {
+        uint8_t *gw = malloc(rb*I), *uw = malloc(rb*I); float *gs = malloc((size_t)I*4), *us = malloc((size_t)I*4);
+        for (size_t i = 0; i < rb*I; i++) { gw[i] = rand()&0xff; uw[i] = rand()&0xff; }
+        for (int o = 0; o < I; o++) { gs[o] = 0.01f; us[o] = 0.01f; }
+        coli_vk_gate_up(&tg[c], &tu[c], h, x, gw, gs, uw, us, fmt, 1, D, I);   /* uploads distinct experts */
+        free(gw); free(uw); free(gs); free(us);
+    }
+    VkDescriptorPoolSize ps = {.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = (uint32_t)(6*K)};
+    VkDescriptorPoolCreateInfo dpi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = (uint32_t)K, .poolSizeCount = 1, .pPoolSizes = &ps};
+    VkDescriptorPool pool; vkCreateDescriptorPool(G.dev, &dpi, NULL, &pool);
+    VkDescriptorSetLayout lays[32]; VkDescriptorSet sets[32]; for (int c = 0; c < K; c++) lays[c] = G.dsl_gu;
+    VkDescriptorSetAllocateInfo dsa = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = pool, .descriptorSetCount = (uint32_t)K, .pSetLayouts = lays};
+    vkAllocateDescriptorSets(G.dev, &dsa, sets);
+    memcpy(G.x.ptr, x, (size_t)D*4);
+    for (int c = 0; c < K; c++) {
+        VkDescriptorBufferInfo bi[6] = {{.buffer=G.x.buf,.range=VK_WHOLE_SIZE},{.buffer=tg[c]->wbuf,.range=VK_WHOLE_SIZE},{.buffer=tg[c]->sbuf,.range=VK_WHOLE_SIZE},{.buffer=tu[c]->wbuf,.range=VK_WHOLE_SIZE},{.buffer=tu[c]->sbuf,.range=VK_WHOLE_SIZE},{.buffer=G.h.buf,.range=VK_WHOLE_SIZE}};
+        VkWriteDescriptorSet w[6]; for (int i = 0; i < 6; i++) w[i] = (VkWriteDescriptorSet){.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=sets[c],.dstBinding=(uint32_t)i,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&bi[i]};
+        vkUpdateDescriptorSets(G.dev, 6, w, 0, NULL);
+    }
+    vkResetCommandBuffer(G.cmd, 0);
+    VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    vkBeginCommandBuffer(G.cmd, &begin);
+    vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_gu);
+    struct PC pc = {fmt, 1, D, I, tg[0]->rowWords};
+    vkCmdPushConstants(G.cmd, G.plyt_gu, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+    VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT};
+    for (int pass = 0; pass < Npass; pass++) for (int c = 0; c < K; c++) {
+        vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_gu, 0, 1, &sets[c], 0, NULL);
+        vkCmdDispatch(G.cmd, (uint32_t)((I+7)/8), 1, 1);
+        vkCmdPipelineBarrier(G.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+    }
+    vkEndCommandBuffer(G.cmd);
+    VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd};
+    for (int w = 0; w < 2; w++) { vkResetFences(G.dev,1,&G.fence); vkQueueSubmit(G.queue,1,&si,G.fence); vkWaitForFences(G.dev,1,&G.fence,VK_TRUE,10000000000ULL); }
+    int iters = 10; double t0 = now();
+    for (int k = 0; k < iters; k++) { vkResetFences(G.dev,1,&G.fence); vkQueueSubmit(G.queue,1,&si,G.fence); vkWaitForFences(G.dev,1,&G.fence,VK_TRUE,10000000000ULL); }
+    double ms = (now()-t0)*1000.0/iters/((double)Npass*K);
+    vkDestroyDescriptorPool(G.dev, pool, NULL);
+    for (int c = 0; c < K; c++) { coli_vk_tensor_free(tg[c]); coli_vk_tensor_free(tu[c]); }
+    free(h); free(x); G.cmd_ready = 0; G.bound_tensor = NULL;
+    return ms;
+}
+
 int main(int argc, char **argv) {
     const char *spv = argc > 1 ? argv[1] : "shaders/qmatmul.spv";
     if (!coli_vk_init(spv)) { printf("vk init failed\n"); return 1; }
@@ -475,6 +649,24 @@ int main(int argc, char **argv) {
                bench_batched(t, x, 2, 1, I, O, 64));
         coli_vk_tensor_free(t); free(x); free(w); free(sc); free(y);
     }
+    /* FUSED gate+up: correctness + batched throughput (vs 2x separate gate/up). */
+    {
+        int D = 6144, I = 2048;
+        bad |= run_gate_up(2, 1, D, I);
+        size_t rb = (size_t)(D + 1) / 2;
+        float *x = malloc((size_t)D*4); uint8_t *gw = malloc(rb*I), *uw = malloc(rb*I);
+        float *gs = malloc((size_t)I*4), *us = malloc((size_t)I*4), *h = malloc((size_t)I*4);
+        for (int i = 0; i < D; i++) x[i] = (rand()%200-100)/100.0f;
+        for (size_t i = 0; i < rb*I; i++) { gw[i] = rand()&0xff; uw[i] = rand()&0xff; }
+        for (int o = 0; o < I; o++) { gs[o] = 0.01f; us[o] = 0.01f; }
+        ColiVkTensor *tg = NULL, *tu = NULL; coli_vk_gate_up(&tg, &tu, h, x, gw, gs, uw, us, 2, 1, D, I);
+        printf("BATCHED fused gate_up int4 6144->2048:     %.4f ms (N=64, SAME expert = L2-cached)\n",
+               bench_gu_batched(tg, x, 2, 1, D, I, 64));
+        coli_vk_tensor_free(tg); coli_vk_tensor_free(tu); free(x); free(gw); free(uw); free(gs); free(us); free(h);
+    }
+    /* FAIR: cycle 8 distinct experts (VRAM reads, not L2) — matches ROCm expert_group. */
+    printf("FAIR fused gate_up int4 6144->2048 (8 distinct experts): %.4f ms/expert\n",
+           bench_experts_fair(2, 6144, 2048, 8, 8));
     printf(bad ? "FAIL\n" : "PASS\n");
     coli_vk_shutdown();
     return bad;
