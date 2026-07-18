@@ -196,6 +196,9 @@ typedef struct {
     ESlot **ecache; int *ecn; int ecap;          /* LRU expert per-layer */
     float **kv_dev_L, **kv_dev_R; int *kv_dev_valid; /* ombra KV su device (decode) */
     float **ln_dev;                              /* in_ln/post_ln cached on device: [layer*2+{0,1}] (Inc.4) */
+#ifdef COLI_VULKAN
+    int *vk_kv_valid;                            /* righe [0,v) specchiate nella cache KV Vulkan */
+#endif
     ESlot ws[64];                                /* working set del layer corrente (load paralleli) */
     ESlot **pin; int *npin;                      /* HOT-STORE: expert pinnati in RAM (mai evicted) */
     uint32_t **eusage;                           /* contatori persistenti (per STATS/PIN) */
@@ -289,6 +292,8 @@ static int g_vk_budget;       /* COLI_VK_EXPERTS: max experts uploaded to VK VRA
 static int g_vk_resident;     /* how many experts currently VK-resident */
 static int g_vk_dense;        /* COLI_VK_DENSE=1: run the resident dense matmuls (attention
                                * projections + shared expert) on Vulkan too */
+static int g_vk_attn;         /* COLI_VK_ATTN=1: run the MLA absorb attention core on Vulkan
+                               * (mirrors COLI_CUDA_ATTN; KV latent cache mirrored on-device) */
 #endif
 #ifdef COLI_CUDA
 static int g_cuda_enabled;
@@ -1155,6 +1160,9 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
     m->ecap=cap; m->ecache=calloc(NR,sizeof(ESlot*)); m->ecn=calloc(NR,sizeof(int));
     m->kv_dev_L=calloc(NR,sizeof(float*)); m->kv_dev_R=calloc(NR,sizeof(float*));
     m->kv_dev_valid=calloc(NR,sizeof(int));
+#ifdef COLI_VULKAN
+    m->vk_kv_valid=calloc(NR,sizeof(int));
+#endif
     m->eroute=calloc(NR,sizeof(int*)); m->enr=calloc(NR,sizeof(int));
     m->pin=calloc(NR,sizeof(ESlot*)); m->npin=calloc(NR,sizeof(int));
     m->eusage=calloc(NR,sizeof(uint32_t*)); m->eheat=calloc(NR,sizeof(uint32_t*));
@@ -2479,6 +2487,10 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
         if(ks==m->kv&&m->kv_dev_valid&&layer<=c->n_layers&&m->kv_dev_valid[layer]>pos)
             m->kv_dev_valid[layer]=pos;              /* riga riscritta: l'ombra si accorcia */
 #endif
+#ifdef COLI_VULKAN
+        if(ks==m->kv&&m->vk_kv_valid&&layer<=c->n_layers&&m->vk_kv_valid[layer]>pos)
+            m->vk_kv_valid[layer]=pos;               /* riga riscritta: la cache VK si accorcia */
+#endif
         memcpy(Ldst, cs, c->kv_lora*sizeof(float));
         rmsnorm(Ldst, Ldst, l->kv_a_ln, c->kv_lora, c->eps);     /* latente normato */
         memcpy(Rdst, cs+c->kv_lora, c->qk_rope*sizeof(float));
@@ -2679,7 +2691,34 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
             }
         }
 #endif
-        if(!cuda_core){
+        int vk_core=0;
+#ifdef COLI_VULKAN
+        /* Vulkan MLA absorb core (COLI_VK_ATTN=1): scores/softmax/latent/value rows for all
+         * S x H in ONE submit per layer, reading the persistent on-device KV mirror (rows
+         * appended incrementally; vk_kv_valid = watermark, invalidated like the CUDA shadow
+         * on rewrite/rebind/resize). Falls back to CPU on DSA top-k selection, ragged KV,
+         * the MTP layer, or any backend failure — output identical either way. */
+        if(!cuda_core&&g_vk_attn&&!kvs&&!positions&&S<=4&&layer<c->n_layers&&
+           (l->kv_b.fmt==1||l->kv_b.fmt==2)&&kvl<=512&&c->qk_nope<=256&&c->qk_rope<=64&&
+           m->vk_kv_valid){
+            int dsa_on=0; if(dnsel) for(int s=0;s<S;s++) if(dnsel[s]>0) dsa_on=1;
+            int st0=m->kv_start[layer], T=pos_base+S;
+            if(!dsa_on&&T<=m->max_t&&coli_vk_kv_ensure(layer,m->max_t,kvl,c->qk_rope)){
+                int ok=1;
+                for(int t=m->vk_kv_valid[layer];t<T&&ok;t++)
+                    ok=coli_vk_kv_row(layer,t,coli_kv_row(m->Lc[layer],t,kvl),
+                                      coli_kv_row(m->Rc[layer],t,c->qk_rope));
+                if(ok){
+                    m->vk_kv_valid[layer]=T;
+                    vk_core=coli_vk_attention_absorb(&l->kv_b.vk,
+                        l->kv_b.fmt==1?(const void*)l->kv_b.q8:(const void*)l->kv_b.q4,
+                        l->kv_b.s,l->kv_b.fmt,ctx,Q,layer,S,H,c->qk_nope,c->qk_rope,
+                        vh,kvl,st0,T,c->attn_scale);
+                }
+            }
+        }
+#endif
+        if(!cuda_core&&!vk_core){
         /* Causal rows grow with s; round-robin pairs keep that work balanced. */
         #pragma omp parallel for collapse(2) schedule(static,1)
         for(int s=0;s<S;s++) for(int h=0;h<H;h++){
@@ -4492,6 +4531,12 @@ static void kv_alloc(Model *m, int max_t){
         m->kv_dev_valid[i]=0;
     }
 #endif
+#ifdef COLI_VULKAN
+    if(g_vulkan&&m->vk_kv_valid){                        /* dimensioni cambiate: cache VK da rifare */
+        coli_vk_kv_reset();
+        for(int i=0;i<c->n_layers+1;i++) m->vk_kv_valid[i]=0;
+    }
+#endif
     if(k->Lc){ for(int i=0;i<c->n_layers+1;i++){
 #ifdef COLI_METAL
         if(g_metal_enabled){ coli_metal_unregister(k->Lc[i]); coli_metal_unregister(k->Rc[i]); }
@@ -4526,6 +4571,10 @@ static void kv_alloc(Model *m, int max_t){
 static void kv_bind(Model *m, KVState *k){
     if(m->kv!=k && m->kv_dev_valid)                 /* ombra legata al KVState corrente */
         for(int i=0;i<m->c.n_layers+1;i++) m->kv_dev_valid[i]=0;
+#ifdef COLI_VULKAN
+    if(m->kv!=k && m->vk_kv_valid)                  /* la cache VK specchia la KV corrente */
+        for(int i=0;i<m->c.n_layers+1;i++) m->vk_kv_valid[i]=0;
+#endif
     m->kv=k; m->Lc=k->Lc; m->Rc=k->Rc; m->Ic=k->Ic;
     m->max_t=k->max_t; m->kv_start=k->kv_start;
 }
@@ -6911,8 +6960,10 @@ int main(int argc, char **argv){
         if(!g_vulkan){ fprintf(stderr,"[VK] Vulkan backend unavailable (need libvulkan + shaders/qmatmul{,_gate_up}.spv)\n"); return 2; }
         g_vk_budget = getenv("COLI_VK_EXPERTS") ? atoi(getenv("COLI_VK_EXPERTS")) : 1024;
         g_vk_dense = getenv("COLI_VK_DENSE") ? atoi(getenv("COLI_VK_DENSE")) : 0;
-        fprintf(stderr,"[VK] expert tier active: routed int4 experts on the GPU (budget %d)%s\n",
-                g_vk_budget, g_vk_dense ? " + dense projections + shared expert" : "");
+        g_vk_attn = getenv("COLI_VK_ATTN") ? atoi(getenv("COLI_VK_ATTN")) : 0;
+        fprintf(stderr,"[VK] expert tier active: routed int4 experts on the GPU (budget %d)%s%s\n",
+                g_vk_budget, g_vk_dense ? " + dense projections + shared expert" : "",
+                g_vk_attn ? " + absorb attention core" : "");
     }
 #endif
 #ifdef COLI_CUDA

@@ -52,6 +52,20 @@ int  coli_vk_expert_group(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
  * then driven by coli_vk_expert_group). Returns 0 on failure/unsupported fmt. */
 int  coli_vk_tensor_ensure(ColiVkTensor **tensor, const void *weights, const float *scales, int fmt, int I, int O);
 
+/* MLA absorb attention core (decode). The KV latent/rope caches live in persistent
+ * per-layer device buffers: _ensure allocates a layer's cache at max_rows (once; resize
+ * via _reset), _row mirrors one host row (absolute position), _reset drops all layers.
+ * The caller keeps a valid-watermark and re-mirrors rows after any invalidation.
+ * absorb runs S causal query rows over cache rows [st0, T) in one submit:
+ * q [S,H*(Q+R)] roped, kv_b [H*(Q+V), K] uploads once (fmt 1=int8/2=int4),
+ * ctx out [S,H*V]. Returns 0 -> caller falls back to CPU. */
+int  coli_vk_kv_ensure(int layer, int max_rows, int K, int Rd);
+int  coli_vk_kv_row(int layer, int pos, const float *L, const float *R);
+void coli_vk_kv_reset(void);
+int  coli_vk_attention_absorb(ColiVkTensor **kvb, const void *w, const float *sc, int fmt,
+                              float *ctx, const float *q, int layer, int S, int H,
+                              int Q, int R, int V, int K, int st0, int T, float scale);
+
 void   coli_vk_tensor_free(ColiVkTensor *t);
 size_t coli_vk_tensor_bytes(const ColiVkTensor *t);
 
