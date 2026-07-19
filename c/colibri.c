@@ -240,6 +240,7 @@ typedef struct {
     int **eroute; int *enr;                      /* metodo C: routing dell'ULTIMO token per layer */
     uint64_t eclock, hits, miss, ereq;
     uint64_t hit_pin, hit_ecache;                /* split di hits per tier (#336): pin vs LRU ecache */
+    uint64_t hit_vk;                             /* VK VRAM tier hits (registry-served, no RAM load) */
     uint64_t gpu_expert_calls; int gpu_expert_count; int64_t gpu_expert_bytes;
     uint64_t n_fw, n_emit;                       /* metodo E: forward di decode / token emessi */
     uint64_t route_slots, route_swaps;            /* CACHE_ROUTE: slots chosen / substituted vs true top-K */
@@ -297,6 +298,12 @@ static struct ColiVkTensor **g_vk_reg;   /* [(layer*E+eid)*3 + {gate,up,down}] *
 static int g_vk_reg_n, g_vk_reg_E;
 static inline struct ColiVkTensor **vk_reg_at(int layer,int eid){
     return g_vk_reg ? &g_vk_reg[((size_t)layer*g_vk_reg_E+eid)*3] : NULL;
+}
+static int g_vk_reg_NL;                  /* registry layer bound (n_layers, MTP excluded) */
+/* Will the VK tier serve this expert at decode? (prefetch/pilot can skip its I/O.) */
+static inline int vk_reg_served(int layer,int eid){
+    if(!g_vk_reg || layer<0 || layer>=g_vk_reg_NL || eid<0 || eid>=g_vk_reg_E) return 0;
+    return g_vk_reg[((size_t)layer*g_vk_reg_E+eid)*3] != NULL;
 }
 static int g_vk_dense;        /* COLI_VK_DENSE=1: run the resident dense matmuls (attention
                                * projections + shared expert) on Vulkan too */
@@ -3276,7 +3283,19 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
     for(int base=0;base<nu;base+=64){
         int nb = nu-base<64 ? nu-base : 64;
         ESlot *use[64]; int missk[64]; int qof[64]; int nmiss=0;
+#ifdef COLI_VULKAN
+        int vk_hit[64]={0};
+#endif
         for(int j=0;j<nb;j++){ int eid=uniq[base+j]; use[j]=NULL; qof[j]=-1;
+#ifdef COLI_VULKAN
+            /* VK VRAM tier first: registry-served experts need NO RAM slot and NO disk
+             * load (the whole point) — and skipping the LRU recency bump lets them age
+             * out of the RAM cache, freeing capacity for the CPU-served experts. */
+            if(vk_active && layer<c->n_layers){
+                ColiVkTensor **rg=vk_reg_at(layer,eid);
+                if(rg && rg[0]){ vk_hit[j]=1; m->hits++; m->hit_vk++; continue; }
+            }
+#endif
             ESlot *P=m->pin[layer];
             for(int z=0;z<m->npin[layer];z++) if(P[z].eid==eid){ m->hits++; m->hit_pin++; use[j]=&P[z]; break; }
             if(!use[j]){ ESlot *Sl=m->ecache[layer]; int nn=m->ecn[layer];
@@ -3364,6 +3383,9 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             int nb2 = nu-(base+64)<64 ? nu-(base+64) : 64;
             for(int j=0;j<nb2;j++){ int eid=uniq[base+64+j]; int found=0;
                 ESlot *P=m->pin[layer];
+#ifdef COLI_VULKAN
+                if(vk_active && vk_reg_served(layer,eid)) found=1;   /* VK-tier-served at decode */
+#endif
                 for(int z=0;z<m->npin[layer] && !found;z++) if(P[z].eid==eid) found=1;
                 ESlot *Sl=m->ecache[layer];
                 for(int z=0;z<m->ecn[layer] && !found;z++) if(Sl[z].eid==eid) found=1;
@@ -3556,28 +3578,29 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
              * pipe + RAM-loads the GPU-side slots (cache invariants: every dispatched slot
              * waited, every use[] slot loaded before the end-of-block LRU swap); pass 4
              * takes the GPU results (fallback: recompute those rows on the CPU). */
-            ColiVkTensor *vg[64],*vu[64],*vd[64]; ESlot *ve[64]; int vrows[64], voff[64], vrmap[64*4]; float vwmap[64*4]; int vqof[64];
+            ColiVkTensor *vg[64],*vu[64],*vd[64]; int veid[64]; int vrows[64], voff[64], vrmap[64*4]; float vwmap[64*4];
             ESlot *ce[64]; int cnr[64], crmap[64*4]; float cwmap[64*4]; int cqof[64];
             int nvk=0, vtot=0, ncpu=0;
             double t0=now_s();
-            for(int j=0;j<nb;j++){ int eid=uniq[base+j]; ESlot *e=use[j];
+            for(int j=0;j<nb;j++){ int eid=uniq[base+j];
                 int nr=0;
                 for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++)
                     if(idxs[(int64_t)s*K+kk]==eid){ rows[nr]=s; rw[nr]=ws[(int64_t)s*K+kk]; nr++; break; }
                 if(!nr){ if(g_pipe && qof[j]>=0){ double tw=now_s(); pipe_wait(qof[j]); m->t_ewait += now_s()-tw; } continue; }
-                ColiVkTensor **reg = layer<c->n_layers ? vk_reg_at(layer,eid) : NULL;
-                if(reg && reg[0] && nvk<64 && (vtot+nr)<=S*K){
+                if(vk_hit[j]){          /* registry-served: no RAM slot, no disk load */
+                    ColiVkTensor **reg=vk_reg_at(layer,eid);
                     voff[nvk]=vtot;
                     for(int r=0;r<nr;r++){ memcpy(vk_xh+(int64_t)(vtot+r)*D, x+(int64_t)rows[r]*D, D*sizeof(float));
                         vrmap[nvk*S+r]=rows[r]; vwmap[nvk*S+r]=rw[r]; }
-                    vg[nvk]=reg[0]; vu[nvk]=reg[1]; vd[nvk]=reg[2]; ve[nvk]=e; vrows[nvk]=nr; vqof[nvk]=qof[j]; vtot+=nr; nvk++;
+                    vg[nvk]=reg[0]; vu[nvk]=reg[1]; vd[nvk]=reg[2]; veid[nvk]=eid; vrows[nvk]=nr; vtot+=nr; nvk++;
                 } else {
-                    ce[ncpu]=e; cnr[ncpu]=nr; cqof[ncpu]=qof[j];
+                    ce[ncpu]=use[j]; cnr[ncpu]=nr; cqof[ncpu]=qof[j];
                     for(int r=0;r<nr;r++){ crmap[ncpu*S+r]=rows[r]; cwmap[ncpu*S+r]=rw[r]; }
                     ncpu++;
                 }
             }
             int vk_issued = nvk>0 && coli_vk_expert_group_issue(vg,vu,vd,vrows,nvk,vk_xh);
+            double t_cpu0=now_s();
             for(int c2=0;c2<ncpu;c2++){ ESlot *e=ce[c2]; int nr=cnr[c2];
                 if(g_pipe && cqof[c2]>=0){ double tw=now_s(); pipe_wait(cqof[c2]); m->t_ewait += now_s()-tw; }
                 if(!e->slab) expert_load(m,layer,e->eid,e,1);
@@ -3587,18 +3610,20 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                 matmul_qt(hh, gg, &e->d, nr);
                 for(int r=0;r<nr;r++){ float *os=out+(int64_t)crmap[c2*S+r]*D, wgt=cwmap[c2*S+r], *hr=hh+(int64_t)r*D;
                     for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
+                if(g_prof){ m->cpu_expert_bytes+=qt_bytes(&e->g)+qt_bytes(&e->u)+qt_bytes(&e->d);
+                    m->cpu_expert_rows+=(uint64_t)nr; }
             }
-            for(int c2=0;c2<nvk;c2++){
-                if(g_pipe && vqof[c2]>=0){ double tw=now_s(); pipe_wait(vqof[c2]); m->t_ewait += now_s()-tw; }
-                ESlot *e=ve[c2]; if(!e->slab) expert_load(m,layer,e->eid,e,1);
-            }
+            if(g_prof) m->t_ecpu+=now_s()-t_cpu0;
+            double t_take0=now_s();
             int vk_ok = vk_issued && coli_vk_expert_group_take(vk_yh);
+            if(g_prof) m->t_egpu+=now_s()-t_take0;
             for(int c2=0;c2<nvk;c2++){ int nr=vrows[c2];
                 if(vk_ok){ int o=voff[c2];
                     for(int r=0;r<nr;r++){ float *os=out+(int64_t)vrmap[c2*S+r]*D, wgt=vwmap[c2*S+r], *src=vk_yh+(int64_t)(o+r)*D;
                         for(int d=0;d<D;d++) os[d]+=wgt*src[d]; }
-                } else {   /* issue/take failed: recompute this expert's rows on the CPU */
-                    ESlot *e=ve[c2];
+                } else {   /* issue/take failed (device lost): load + recompute on the CPU */
+                    ESlot *e=&m->ws[nmiss<63?nmiss:63];
+                    if(e->eid!=veid[c2] || !e->slab) expert_load(m,layer,veid[c2],e,1);
                     for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D, x+(int64_t)vrmap[c2*S+r]*D, D*sizeof(float));
                     expert_gate_up(gg,uu,xg,&e->g,&e->u,nr);
                     for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
@@ -3607,7 +3632,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                         for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
                 }
             }
-            double dt=now_s()-t0; m->t_emm+=dt; if(g_prof) m->t_egpu+=dt;
+            double dt=now_s()-t0; m->t_emm+=dt;
         }
 #endif
         if(!metal_done && !xexp_done && !vk_active)
@@ -3983,6 +4008,9 @@ static void pilot_realload(Model *m, int layer, int eid){
         pthread_mutex_unlock(&g_pilot_mx); return;      /* il main possiede gia' questo layer */
     }
     ESlot *P=m->pin[layer];                             /* gia' residente (pin o ecache)? skip */
+#ifdef COLI_VULKAN
+    if(vk_reg_served(layer,eid)){ pthread_mutex_unlock(&g_pilot_mx); return; }   /* VK-tier-served: no load */
+#endif
     for(int z=0;z<m->npin[layer];z++) if(P[z].eid==eid){ pthread_mutex_unlock(&g_pilot_mx); return; }
     ESlot *Sl=m->ecache[layer]; int nn=m->ecn[layer];
     for(int z=0;z<nn;z++) if(Sl[z].eid==eid){ pthread_mutex_unlock(&g_pilot_mx); return; }
@@ -4041,6 +4069,9 @@ static void pilot_uring_batch(Model *m){
             pthread_mutex_unlock(&g_pilot_mx); continue;
         }
         int found=0; ESlot *P=m->pin[layer];
+#ifdef COLI_VULKAN
+        if(vk_reg_served(layer,eid)) found=1;               /* VK-tier-served: no load */
+#endif
         for(int z=0;z<m->npin[layer];z++) if(P[z].eid==eid){found=1;break;}
         ESlot *Sl=m->ecache[layer]; int nn=m->ecn[layer];
         for(int z=0;z<nn && !found;z++) if(Sl[z].eid==eid || Sl[z].eid==-(eid+2)) found=1;
@@ -4183,6 +4214,9 @@ static void couple_prefetch(Model *m, int layer, const int *idx, int Ke){
             int found=0;                            /* residency scan, same locking as pilot */
             pthread_mutex_lock(&g_pilot_mx);
             ESlot *P=m->pin[lt];
+#ifdef COLI_VULKAN
+            if(vk_reg_served(lt,best)) found=1;             /* VK-tier-served: no load */
+#endif
             for(int z=0;z<m->npin[lt] && !found;z++) if(P[z].eid==best) found=1;
             ESlot *Sl=m->ecache[lt];
             for(int z=0;z<m->ecn[lt] && !found;z++)
@@ -4245,6 +4279,9 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S){
             int found=0;
             pthread_mutex_lock(&g_pilot_mx);
             ESlot *P=m->pin[lnext];
+#ifdef COLI_VULKAN
+            if(vk_reg_served(lnext,best)) found=1;          /* VK-tier-served: no load */
+#endif
             for(int z=0;z<m->npin[lnext] && !found;z++) if(P[z].eid==best) found=1;
             ESlot *Sl=m->ecache[lnext];
             for(int z=0;z<m->ecn[lnext] && !found;z++)
@@ -5287,7 +5324,7 @@ static void run_replay(Model *m, const int *full, int nfull, int np){
     if(np<2||nfull<=np){ fprintf(stderr,"REPLAY requires a non-empty prompt and continuation\n"); return; }
     kv_alloc(m,nfull+2);
     float *logit=step(m,full,np-1,0); free(logit);
-    m->hits=m->miss=m->ereq=m->gpu_expert_calls=0; m->hit_pin=m->hit_ecache=0;
+    m->hits=m->miss=m->ereq=m->gpu_expert_calls=0; m->hit_pin=m->hit_ecache=0; m->hit_vk=0;
     profile_reset(m);
     ProfBase pb; prof_base(m,&pb);
     atomic_store(&g_mir_bytes[0],0); atomic_store(&g_mir_bytes[1],0);
@@ -5351,7 +5388,7 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     }
     prefill_t=now_s()-prefill_t;
     printf("PROFILO PREFILL (%.2fs):\n",prefill_t); profile_print(m,prefill_t);
-    m->hits=m->miss=m->ereq=m->gpu_expert_calls=0; m->hit_pin=m->hit_ecache=0;
+    m->hits=m->miss=m->ereq=m->gpu_expert_calls=0; m->hit_pin=m->hit_ecache=0; m->hit_vk=0;
     m->n_emit=m->n_fw=0;
     g_last_repin=0;
     profile_reset(m);
@@ -5364,9 +5401,11 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     double tot=m->hits+m->miss;
     int nsp=0; for(int i=0;i<c->n_layers;i++) if(m->L[i].sparse) nsp++;
     printf("\n---\nprefill %d tokens in %.2fs | decode %d tokens in %.2fs (%.2f tok/s) | "
-           "expert hit rate %.1f%% (pin %.1f%% + lru %.1f%%) | RSS %.2f GB",       /* split #336: quale tier serve gli hit */
+           "expert hit rate %.1f%% (pin %.1f%% + lru %.1f%%%s) | RSS %.2f GB",     /* split #336 (+VK VRAM tier) */
         np,prefill_t,produced,dt,produced/dt,tot?100.0*m->hits/tot:0.0,
-        tot?100.0*m->hit_pin/tot:0.0, tot?100.0*m->hit_ecache/tot:0.0, rss_gb());
+        tot?100.0*m->hit_pin/tot:0.0, tot?100.0*m->hit_ecache/tot:0.0,
+        m->hit_vk?({ static char vkb[40]; snprintf(vkb,sizeof(vkb)," + vk %.1f%%",tot?100.0*m->hit_vk/tot:0.0); vkb; }):"",
+        rss_gb());
     if(g_cache_route && m->route_slots)
         printf(" | swap %.1f%% (%llu/%llu)",
             100.0*m->route_swaps/m->route_slots,
@@ -6242,7 +6281,7 @@ static void vk_registry_fill(Model *m){
     for(int i=0;i<NL;i++) if(m->eusage[i]) for(int e=0;e<E;e++)
         if(m->eusage[i][e]) cand[n++]=(VkCand){m->eusage[i][e],i,e};
     qsort(cand,(size_t)n,sizeof(VkCand),vk_cand_cmp);
-    g_vk_reg=calloc((size_t)NL*E*3,sizeof(*g_vk_reg)); g_vk_reg_E=E;
+    g_vk_reg=calloc((size_t)NL*E*3,sizeof(*g_vk_reg)); g_vk_reg_E=E; g_vk_reg_NL=NL;
     if(!g_vk_reg){ free(cand); return; }
     ESlot tmp; memset(&tmp,0,sizeof(tmp)); tmp.eid=-1;
     double t0=now_s(); int64_t bytes=0; int tried=0;
