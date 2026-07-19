@@ -88,6 +88,18 @@ Format: `VAR` — default — effect.
 
 Per-drive byte counts are reported in a `MIRROR:` stats line. Combine with `DIRECT=1` so the two copies never compete for page cache.
 
+## Vulkan (any GPU with a Vulkan 1.2 driver)
+
+| Variable | Default | Effect |
+|---|---|---|
+| `COLI_VULKAN` | off | Enable the Vulkan backend. Requires a `make VK=1` build; fails at startup (no silent fallback) if libvulkan or the compiled shaders are missing. |
+| `COLI_VK_SHADERS` | `shaders/qmatmul.spv` | Path to the compiled main shader; the gate_up and attention shaders are found next to it. |
+| `COLI_VK_EXPERTS` | `320` | Pinned VRAM expert tier size: top-N experts by `.coli_usage` heat uploaded once at startup and served from VRAM with no RAM slot or disk read. `0` disables the tier (experts stay on the CPU path). ~19 MB VRAM per int4 expert. |
+| `COLI_VK_DENSE` | `0` | Run the resident dense matmuls (attention projections, shared expert) on the GPU. |
+| `COLI_VK_ATTN` | `0` | Run the S≤4 MLA absorb attention core (+ fused o-projection) on the GPU, with a persistent device-side KV mirror. |
+
+See [docs/vulkan.md](vulkan.md). On multi-core boxes also set `COLI_NO_OMP_TUNE=1` (see that doc for why).
+
 ## CUDA (NVIDIA)
 
 | Variable | Default | Effect |
