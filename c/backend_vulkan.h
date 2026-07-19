@@ -65,6 +65,12 @@ void coli_vk_kv_reset(void);
 int  coli_vk_attention_absorb(ColiVkTensor **kvb, const void *w, const float *sc, int fmt,
                               float *ctx, const float *q, int layer, int S, int H,
                               int Q, int R, int V, int K, int st0, int T, float scale);
+/* Two resident matmuls sharing one input x in ONE submit (q_a + kv_a prologue pair).
+ * Returns 0 -> caller falls back to single-matmul calls. */
+int  coli_vk_matmul_pair(ColiVkTensor **t1p, float *y1, const void *w1, const float *s1, int O1,
+                         ColiVkTensor **t2p, float *y2, const void *w2, const float *s2, int O2,
+                         int fmt, const float *x, int S, int I);
+
 /* Fused variant: absorb + resident o-projection ([Dout, H*V]) in one submit; ctx stays
  * on-device, only out [S,Dout] is read back. Falls back like absorb (returns 0). */
 int  coli_vk_attention_absorb_project(ColiVkTensor **kvb, const void *w, const float *sc, int fmt,

@@ -323,6 +323,14 @@ static int vk_matmul_qt(QT *t, float *y, const float *x, int S){
     const void *w = t->fmt==1 ? (const void*)t->q8 : (const void*)t->q4;
     return coli_vk_matmul(&t->vk, y, x, w, t->s, t->fmt, S, t->I, t->O);
 }
+/* Two same-input resident matmuls in one submit (q_a + kv_a read the same x). */
+static int vk_matmul_pair_qt(QT *a, float *ya, QT *b, float *yb, const float *x, int S){
+    if(!g_vk_dense || a->fmt!=b->fmt || (a->fmt!=1 && a->fmt!=2) || a->I!=b->I) return 0;
+    const void *wa = a->fmt==1 ? (const void*)a->q8 : (const void*)a->q4;
+    const void *wb = b->fmt==1 ? (const void*)b->q8 : (const void*)b->q4;
+    return coli_vk_matmul_pair(&a->vk, ya, wa, a->s, a->O,
+                               &b->vk, yb, wb, b->s, b->O, a->fmt, x, S, a->I);
+}
 #endif
 #ifdef COLI_CUDA
 static int qt_cuda_upload(QT *t){
@@ -2460,7 +2468,12 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
         pipe_done=attn_pipe_prefill(m,l,layer,x,0,S,pos_base,out,NULL);
 #endif
     if(!pipe_done){
+        int vk_pair=0; (void)vk_pair;
 #ifdef COLI_VULKAN
+        /* q_a and kv_a read the SAME x: one fused submit for the pair (one x upload,
+         * one fence) instead of two full roundtrips. Fallback = the single calls. */
+        vk_pair=vk_matmul_pair_qt(&l->q_a, QR, &l->kv_a, comp, x, S);
+        if(!vk_pair)
         if(!vk_matmul_qt(&l->q_a, QR, x, S))
 #endif
         matmul_qt_ex(QR, x, &l->q_a, S, 0);
@@ -2471,6 +2484,7 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
 #endif
         matmul_qt_ex(Q, QR, &l->q_b, S, 0);
 #ifdef COLI_VULKAN
+        if(!vk_pair)
         if(!vk_matmul_qt(&l->kv_a, comp, x, S))
 #endif
         matmul_qt_ex(comp, x, &l->kv_a, S, 0);
