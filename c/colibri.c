@@ -2729,7 +2729,10 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
          * the MTP layer, or any backend failure — output identical either way. */
         if(!cuda_core&&g_vk_attn&&!kvs&&!positions&&S<=4&&layer<c->n_layers&&
            (l->kv_b.fmt==1||l->kv_b.fmt==2)&&kvl<=512&&c->qk_nope<=256&&c->qk_rope<=64&&
-           m->vk_kv_valid){
+           m->vk_kv_valid&&m->Lc[layer]&&m->Rc[layer]){   /* f32 KV only: a quantized-KV cache
+                                                * (upstream #399 KV8/TQ leaves Lc/Rc NULL)
+                                                * falls back to the CPU path until the VK
+                                                * mirror learns fp8 */
             int dsa_on=0; if(dnsel) for(int s=0;s<S;s++) if(dnsel[s]>0) dsa_on=1;
             int st0=m->kv_start[layer], T=pos_base+S;
             if(!dsa_on&&T<=m->max_t&&coli_vk_kv_ensure(layer,m->max_t,kvl,c->qk_rope)){
