@@ -7110,7 +7110,9 @@ int main(int argc, char **argv){
         const char *spv = getenv("COLI_VK_SHADERS"); if(!spv) spv = "shaders/qmatmul.spv";
         g_vulkan = coli_vk_init(spv);
         if(!g_vulkan){ fprintf(stderr,"[VK] Vulkan backend unavailable (need libvulkan + shaders/qmatmul{,_gate_up}.spv)\n"); return 2; }
-        g_vk_budget = getenv("COLI_VK_EXPERTS") ? atoi(getenv("COLI_VK_EXPERTS")) : 1024;
+        /* 320 = sweep optimum on a 16 GB card (256-384 measured flat, 320 best median;
+         * ~6 GB tier + ~8 GB dense leaves headroom for the long-context KV mirror). */
+        g_vk_budget = getenv("COLI_VK_EXPERTS") ? atoi(getenv("COLI_VK_EXPERTS")) : 320;
         g_vk_dense = getenv("COLI_VK_DENSE") ? atoi(getenv("COLI_VK_DENSE")) : 0;
         g_vk_attn = getenv("COLI_VK_ATTN") ? atoi(getenv("COLI_VK_ATTN")) : 0;
         fprintf(stderr,"[VK] expert tier active: routed int4 experts on the GPU (budget %d)%s%s\n",
