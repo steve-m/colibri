@@ -3606,7 +3606,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             double t_cpu0=now_s();
             for(int c2=0;c2<ncpu;c2++){ ESlot *e=ce[c2]; int nr=cnr[c2];
                 if(g_pipe && cqof[c2]>=0){ double tw=now_s(); pipe_wait(cqof[c2]); m->t_ewait += now_s()-tw; }
-                if(!e->slab) expert_load(m,layer,e->eid,e,1);
+                if(!e->slab) expert_load(m,layer,e->eid,e,1,1);   /* demand=1: moe miss path (FASE A snapshot valid) */
                 for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D, x+(int64_t)crmap[c2*S+r]*D, D*sizeof(float));
                 expert_gate_up(gg,uu,xg,&e->g,&e->u,nr);
                 for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
@@ -3626,7 +3626,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                         for(int d=0;d<D;d++) os[d]+=wgt*src[d]; }
                 } else {   /* issue/take failed (device lost): load + recompute on the CPU */
                     ESlot *e=&m->ws[nmiss<63?nmiss:63];
-                    if(e->eid!=veid[c2] || !e->slab) expert_load(m,layer,veid[c2],e,1);
+                    if(e->eid!=veid[c2] || !e->slab) expert_load(m,layer,veid[c2],e,1,0);   /* device-lost recovery: DISK-CLASS leaves it unclassified */
                     for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D, x+(int64_t)vrmap[c2*S+r]*D, D*sizeof(float));
                     expert_gate_up(gg,uu,xg,&e->g,&e->u,nr);
                     for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
@@ -6292,7 +6292,7 @@ static void vk_registry_fill(Model *m){
         int layer=cand[i2].layer, eid=cand[i2].eid; tried++;
         ESlot *src=NULL, *P=m->pin[layer];
         for(int z=0;z<m->npin[layer];z++) if(P[z].eid==eid && P[z].slab){ src=&P[z]; break; }
-        if(!src){ if(expert_load(m,layer,eid,&tmp,0)!=0){   /* 0 = success (impl convention) */
+        if(!src){ if(expert_load(m,layer,eid,&tmp,0,0)!=0){   /* 0 = success (impl convention); demand=0: startup tier fill */
                 if(++loadfail<4) fprintf(stderr,"[VK] tier fill: expert_load(%d,%d) failed\n",layer,eid);
                 if(loadfail>=64) break;                     /* disk trouble: stop burning time */
                 continue; } src=&tmp; }
