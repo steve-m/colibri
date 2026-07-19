@@ -3237,7 +3237,8 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
 #endif
     int vk_active = 0; (void)vk_active;
 #ifdef COLI_VULKAN
-    vk_active = g_vulkan && !omp_in_parallel() && S<=4;
+    vk_active = g_vulkan && g_vk_budget>0 && !omp_in_parallel() && S<=4;   /* budget 0 = tier off,
+                                                * experts stay on the normal (parallel) CPU loop */
     float *vk_xh = vk_active?falloc((int64_t)S*K*D):NULL;
     float *vk_yh = vk_active?falloc((int64_t)S*K*D):NULL;
 #endif
