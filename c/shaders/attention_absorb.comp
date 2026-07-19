@@ -11,7 +11,10 @@
 // L/R are the PERSISTENT device-side latent/rope caches (rows appended by the
 // host each token, absolute position indexing). Queries arrive already roped;
 // cache rows already normed+roped (host writes them that way).
-// fmt: 1=int8, 2=int4 (nibble-8). Limits: Q<=256, R<=64, K<=512 (shared arrays).
+// fmt: 1=int8, 2=int4 (nibble-8), 5=int3-g64 (24B/64-group two-plane packing, ONE
+// f32 scale per group: wsc[] holds rows*ceil(K/64) entries; for the row-scale
+// formats the scale folds into qsc[] once, for fmt=5 it is applied per (row,group)
+// inside the passes). Limits: Q<=256, R<=64, K<=512 (shared arrays).
 #extension GL_KHR_shader_subgroup_arithmetic : require
 layout(local_size_x = 256) in;
 
@@ -40,6 +43,14 @@ shared float red[256];    // reduction scratch
 
 float i8(uint x, int l) { int b = int((x >> (uint(l) * 8u)) & 0xffu); if (b >= 128) b -= 256; return float(b); }
 float i4(uint x, int l) { return float(int((x >> (uint(l) * 4u)) & 0xfu) - 8); }
+// int3-g64: raw integer value in [-4,3] of element i of weight row `row` (scale separate)
+float i3v(int row, int i) {
+    int g = i >> 6, j = i & 63;
+    uint blo = w[row * p.rowWords + g * 6 + (j >> 4)];
+    uint bhi = w[row * p.rowWords + g * 6 + 4 + (j >> 5)];
+    uint u = ((blo >> uint((j & 15) * 2)) & 3u) | (((bhi >> uint(j & 31)) & 1u) << 2);
+    return float(int(u) - 4);
+}
 
 void main() {
     int h   = int(gl_WorkGroupID.x);
@@ -56,16 +67,24 @@ void main() {
     int qoff  = (s * p.H + h) * (p.Q + p.R);
     int scoff = (s * p.H + h) * p.cap;
 
-    for (int d = tid; d < p.Q; d += nth) qsc[d] = q[qoff + d] * wsc[rbase + d];
+    // Row-scale formats fold each kv_b row's scale into the query element once (the
+    // scale factors out of the i-sum). fmt=5 scales vary along i (per 64-group), so
+    // qsc[] stays UNSCALED and the (row,group) scale applies inside pass 1.
+    for (int d = tid; d < p.Q; d += nth) qsc[d] = p.fmt == 5 ? q[qoff + d] : q[qoff + d] * wsc[rbase + d];
     for (int d = tid; d < p.R; d += nth) qr[d] = q[qoff + p.Q + d];
     barrier();
 
     /* 1) absorbed query: qabs = Wnope^T qsc — thread-parallel over latent dim i */
+    int ng = (p.K + 63) >> 6;                       // int3-g64 groups per kv_b row
     for (int i = tid; i < p.K; i += nth) {
         float acc = 0.0;
         if (p.fmt == 1) {
             int wi = i >> 2, l = i & 3;
             for (int d = 0; d < p.Q; d++) acc += qsc[d] * i8(w[(rbase + d) * p.rowWords + wi], l);
+        } else if (p.fmt == 5) {
+            int gi = i >> 6;                        // this thread's i sits in ONE group per row
+            for (int d = 0; d < p.Q; d++)
+                acc += qsc[d] * i3v(rbase + d, i) * wsc[(rbase + d) * ng + gi];
         } else {
             int wi = i >> 3, l = i & 7;
             for (int d = 0; d < p.Q; d++) acc += qsc[d] * i4(w[(rbase + d) * p.rowWords + wi], l);
@@ -114,6 +133,23 @@ void main() {
                 uint pk = w[rb + uint(wi)]; int i0 = wi * 4;
                 for (int k = 0; k < 4; k++) { int i = i0 + k; if (i < p.K) acc += clat[i] * i8(pk, k); }
             }
+        } else if (p.fmt == 5) {   // lanes stride 16-value low-plane words, group scale per partial
+            for (int m = lane; m < ng * 4; m += sgsize) {
+                int g = m >> 2, mw = m & 3;
+                uint blo = w[rb + uint(g) * 6u + uint(mw)];
+                uint bhi = w[rb + uint(g) * 6u + 4u + uint(mw >> 1)];
+                int hs = (mw & 1) * 16;
+                int i0 = (g << 6) + (mw << 4);
+                float a = 0.0;
+                for (int k = 0; k < 16; k++) {
+                    int i = i0 + k;
+                    if (i < p.K) {
+                        uint u = ((blo >> uint(k * 2)) & 3u) | (((bhi >> uint(hs + k)) & 1u) << 2);
+                        a += clat[i] * float(int(u) - 4);
+                    }
+                }
+                acc += a * wsc[row * ng + g];
+            }
         } else {
             int words = (p.K + 7) / 8;
             for (int wi = lane; wi < words; wi += sgsize) {
@@ -122,6 +158,6 @@ void main() {
             }
         }
         float tot = subgroupAdd(acc);
-        if (lane == 0) ctx[(s * p.H + h) * p.V + v] = tot * wsc[row];
+        if (lane == 0) ctx[(s * p.H + h) * p.V + v] = p.fmt == 5 ? tot : tot * wsc[row];
     }
 }

@@ -7,7 +7,9 @@
 // The whole expert MLP first half in ONE dispatch: x is read ONCE from shared and
 // reused for both projections (half the activation traffic + one launch instead of
 // two), one subgroup per output row, subgroupAdd reduction, grid-stride over rows.
-// fmt: 1=int8, 2=int4 (nibble-8).
+// fmt: 1=int8, 2=int4 (nibble-8), 5=int3-g64 (24B/64-group two-plane packing with
+// ONE f32 scale per group — gscale/uscale hold O*ceil(I/64) entries; the per-row
+// multiply after the reduction does not apply, the group scale folds in per-lane).
 #extension GL_KHR_shader_subgroup_arithmetic : require
 layout(local_size_x = 256) in;
 
@@ -19,7 +21,7 @@ layout(std430, binding = 4) readonly buffer SU { float uscale[]; };
 layout(std430, binding = 5) writeonly buffer H { float hid[]; };
 
 layout(push_constant) uniform P {
-    int fmt;        // 1=int8, 2=int4
+    int fmt;        // 1=int8, 2=int4, 5=int3-g64
     int S, I, O;    // I = input dim (hidden), O = moe_inter
     int rowWords;   // uint32 words per weight row (of the I-dim rows)
 } p;
@@ -52,6 +54,31 @@ void main() {
                 uint gp = wg[rb + uint(wi)], upk = wu[rb + uint(wi)]; int i0 = wi * 4;
                 for (int k = 0; k < 4; k++) { int i = i0 + k; if (i < p.I) { float xv = xsh[i]; g += xv * i8(gp, k); u += xv * i8(upk, k); } }
             }
+        } else if (p.fmt == 5) { // int3-g64: lanes stride 16-value low-plane words; one
+            // group scale per word-partial (gate and up have independent scale arrays)
+            int ng = (p.I + 63) >> 6;
+            uint sb = uint(o) * uint(ng);
+            for (int m = lane; m < ng * 4; m += sgsize) {
+                int gi = m >> 2, mw = m & 3;
+                uint wbase = rb + uint(gi) * 6u;
+                uint glo = wg[wbase + uint(mw)], ghi = wg[wbase + 4u + uint(mw >> 1)];
+                uint ulo = wu[wbase + uint(mw)], uhi = wu[wbase + 4u + uint(mw >> 1)];
+                int hs = (mw & 1) * 16;
+                int i0 = (gi << 6) + (mw << 4);
+                float ga = 0.0, ua = 0.0;
+                for (int k = 0; k < 16; k++) {
+                    int i = i0 + k;
+                    if (i < p.I) {
+                        float xv = xsh[i];
+                        uint gv = ((glo >> uint(k * 2)) & 3u) | (((ghi >> uint(hs + k)) & 1u) << 2);
+                        uint uv = ((ulo >> uint(k * 2)) & 3u) | (((uhi >> uint(hs + k)) & 1u) << 2);
+                        ga += xv * float(int(gv) - 4);
+                        ua += xv * float(int(uv) - 4);
+                    }
+                }
+                g += ga * gscale[sb + uint(gi)];
+                u += ua * uscale[sb + uint(gi)];
+            }
         } else { // int4
             int words = (p.I + 7) / 8;
             for (int wi = lane; wi < words; wi += sgsize) {
@@ -59,8 +86,8 @@ void main() {
                 for (int k = 0; k < 8; k++) { int i = i0 + k; if (i < p.I) { float xv = xsh[i]; g += xv * i4(gp, k); u += xv * i4(upk, k); } }
             }
         }
-        float gt = subgroupAdd(g) * gscale[o];
-        float ut = subgroupAdd(u) * uscale[o];
+        float gt = subgroupAdd(g), ut = subgroupAdd(u);
+        if (p.fmt != 5) { gt *= gscale[o]; ut *= uscale[o]; }   // per-row formats only
         if (lane == 0) hid[s * p.O + o] = (gt / (1.0 + exp(-gt))) * ut;   // silu(gate)*up
     }
 }

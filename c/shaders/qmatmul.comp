@@ -1,8 +1,11 @@
 #version 450
 // Quantized mat-vec/mat-mat mirroring colibri's CUDA quant_matmul:
 //   y[s,o] = ( sum_i x[s,i] * dequant(W[o,i]) ) * scale[o]
-// fmt: 1=int8, 2=int4 (packed 2/byte, nibble-8). Weights are a byte buffer
-// exposed as uint32 words; bytes/nibbles are extracted manually.
+// fmt: 1=int8, 2=int4 (packed 2/byte, nibble-8), 5=int3-g64 (per 64-input group:
+// 24 bytes = 16B low plane [2 bits/val] + 8B high plane [1 bit/val], values v+4 in
+// [-4,3], ONE f32 scale PER GROUP — scale[] holds O*ceil(I/64) entries and the
+// per-row multiply at the end does not apply). Weights are a byte buffer exposed
+// as uint32 words; bytes/nibbles/planes are extracted manually.
 //
 // Optimized decode (S=1) GEMV, techniques adapted from llama.cpp's mul_mat_vec
 // (MIT) to colibri's per-row int4/int8 layout:
@@ -23,7 +26,7 @@ layout(std430, binding = 2) readonly buffer Sc { float scale[]; };
 layout(std430, binding = 3) writeonly buffer Y { float y[]; };
 
 layout(push_constant) uniform P {
-    int fmt;        // 1=int8, 2=int4
+    int fmt;        // 1=int8, 2=int4, 5=int3-g64
     int S, I, O;
     int rowWords;   // uint32 words per weight row
 } p;
@@ -72,6 +75,27 @@ void main() {
                 uint pk = w[rowBase + uint(wi)]; int i0 = wi * 4;
                 for (int k = 0; k < 4; k++) { int i = i0 + k; if (i < p.I) sum += x[xoff + i] * i8(pk, k); }
             }
+        } else if (p.fmt == 5) { // int3-g64: lanes stride the 16-value LOW-PLANE words;
+            // all 16 values of one low word share a group, so its scale multiplies the
+            // 16-wide partial directly and the per-row scale at the end must NOT run.
+            int ng = (p.I + 63) >> 6;
+            uint sb = uint(o) * uint(ng);
+            for (int m = lane; m < ng * 4; m += sgsize) {
+                int g = m >> 2, mw = m & 3;                   // group, low-word within group
+                uint blo = w[rowBase + uint(g) * 6u + uint(mw)];
+                uint bhi = w[rowBase + uint(g) * 6u + 4u + uint(mw >> 1)];
+                int hs = (mw & 1) * 16;                       // this word's bits in the high plane
+                int i0 = (g << 6) + (mw << 4);
+                float a = 0.0;
+                for (int k = 0; k < 16; k++) {
+                    int i = i0 + k;
+                    if (i < p.I) {
+                        uint u = ((blo >> uint(k * 2)) & 3u) | (((bhi >> uint(hs + k)) & 1u) << 2);
+                        a += (staged ? xsh[i] : x[xoff + i]) * float(int(u) - 4);
+                    }
+                }
+                sum += a * scale[sb + uint(g)];
+            }
         } else { // int4
             int words = (p.I + 7) / 8;
             if (staged) for (int wi = lane; wi < words; wi += sgsize) {
@@ -83,6 +107,6 @@ void main() {
             }
         }
         float tot = subgroupAdd(sum);
-        if (lane == 0) y[s * p.O + o] = tot * scale[o];
+        if (lane == 0) y[s * p.O + o] = p.fmt == 5 ? tot : tot * scale[o];
     }
 }
