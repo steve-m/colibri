@@ -65,6 +65,12 @@ void coli_vk_kv_reset(void);
 int  coli_vk_attention_absorb(ColiVkTensor **kvb, const void *w, const float *sc, int fmt,
                               float *ctx, const float *q, int layer, int S, int H,
                               int Q, int R, int V, int K, int st0, int T, float scale);
+/* Fused variant: absorb + resident o-projection ([Dout, H*V]) in one submit; ctx stays
+ * on-device, only out [S,Dout] is read back. Falls back like absorb (returns 0). */
+int  coli_vk_attention_absorb_project(ColiVkTensor **kvb, const void *w, const float *sc, int fmt,
+                              ColiVkTensor **ot, const void *ow, const float *osc, int ofmt,
+                              float *out, const float *q, int layer, int S, int H,
+                              int Q, int R, int V, int K, int st0, int T, float scale, int Dout);
 
 void   coli_vk_tensor_free(ColiVkTensor *t);
 size_t coli_vk_tensor_bytes(const ColiVkTensor *t);

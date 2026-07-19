@@ -29,6 +29,9 @@ layout(push_constant) uniform P {
 } p;
 
 // Max hidden dim across GLM expert matmuls is 6144 (24 KB LDS); down-proj uses 2048.
+// Rows longer than the staging array (o_proj: I = H*vh = 16384) skip shared staging
+// and read x straight from the storage buffer — an unstaged read is coalesced across
+// the subgroup and still correct, while an unchecked stage would write past xsh.
 shared float xsh[6144];
 
 float i8(uint word, int lane) {
@@ -46,8 +49,10 @@ void main() {
     int nth = int(gl_WorkGroupSize.x);
 
     // Stage x[s,:] into shared once; all rows this workgroup computes reuse it.
-    for (int i = tid; i < p.I; i += nth) xsh[i] = x[s * p.I + i];
+    bool staged = p.I <= 6144;
+    if (staged) for (int i = tid; i < p.I; i += nth) xsh[i] = x[s * p.I + i];
     barrier();
+    int xoff = s * p.I;
 
     int sg      = int(gl_SubgroupID);
     int lane    = int(gl_SubgroupInvocationID);
@@ -60,15 +65,21 @@ void main() {
         float sum = 0.0;
         if (p.fmt == 1) {
             int words = (p.I + 3) / 4;
-            for (int wi = lane; wi < words; wi += sgsize) {
+            if (staged) for (int wi = lane; wi < words; wi += sgsize) {
                 uint pk = w[rowBase + uint(wi)]; int i0 = wi * 4;
                 for (int k = 0; k < 4; k++) { int i = i0 + k; if (i < p.I) sum += xsh[i] * i8(pk, k); }
+            } else for (int wi = lane; wi < words; wi += sgsize) {
+                uint pk = w[rowBase + uint(wi)]; int i0 = wi * 4;
+                for (int k = 0; k < 4; k++) { int i = i0 + k; if (i < p.I) sum += x[xoff + i] * i8(pk, k); }
             }
         } else { // int4
             int words = (p.I + 7) / 8;
-            for (int wi = lane; wi < words; wi += sgsize) {
+            if (staged) for (int wi = lane; wi < words; wi += sgsize) {
                 uint pk = w[rowBase + uint(wi)]; int i0 = wi * 8;
                 for (int k = 0; k < 8; k++) { int i = i0 + k; if (i < p.I) sum += xsh[i] * i4(pk, k); }
+            } else for (int wi = lane; wi < words; wi += sgsize) {
+                uint pk = w[rowBase + uint(wi)]; int i0 = wi * 8;
+                for (int k = 0; k < 8; k++) { int i = i0 + k; if (i < p.I) sum += x[xoff + i] * i4(pk, k); }
             }
         }
         float tot = subgroupAdd(sum);

@@ -2691,7 +2691,7 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
             }
         }
 #endif
-        int vk_core=0;
+        int vk_core=0, vk_projected=0;
 #ifdef COLI_VULKAN
         /* Vulkan MLA absorb core (COLI_VK_ATTN=1): scores/softmax/latent/value rows for all
          * S x H in ONE submit per layer, reading the persistent on-device KV mirror (rows
@@ -2710,10 +2710,18 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                                       coli_kv_row(m->Rc[layer],t,c->qk_rope));
                 if(ok){
                     m->vk_kv_valid[layer]=T;
-                    vk_core=coli_vk_attention_absorb(&l->kv_b.vk,
-                        l->kv_b.fmt==1?(const void*)l->kv_b.q8:(const void*)l->kv_b.q4,
-                        l->kv_b.s,l->kv_b.fmt,ctx,Q,layer,S,H,c->qk_nope,c->qk_rope,
-                        vh,kvl,st0,T,c->attn_scale);
+                    const void *kw=l->kv_b.fmt==1?(const void*)l->kv_b.q8:(const void*)l->kv_b.q4;
+                    /* fused absorb + o-projection: ctx never leaves the device */
+                    if((l->o.fmt==1||l->o.fmt==2)&&
+                       coli_vk_attention_absorb_project(&l->kv_b.vk,kw,l->kv_b.s,l->kv_b.fmt,
+                            &l->o.vk,l->o.fmt==1?(const void*)l->o.q8:(const void*)l->o.q4,
+                            l->o.s,l->o.fmt,out,Q,layer,S,H,c->qk_nope,c->qk_rope,
+                            vh,kvl,st0,T,c->attn_scale,D))
+                        vk_core=vk_projected=1;
+                    if(!vk_core)
+                        vk_core=coli_vk_attention_absorb(&l->kv_b.vk,kw,
+                            l->kv_b.s,l->kv_b.fmt,ctx,Q,layer,S,H,c->qk_nope,c->qk_rope,
+                            vh,kvl,st0,T,c->attn_scale);
                 }
             }
         }
@@ -2787,7 +2795,7 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
         }
         }
         m->t_acore+=now_s()-tac; double tao=now_s();
-        if(!cuda_projected){
+        if(!cuda_projected&&!vk_projected){
 #ifdef COLI_VULKAN
             if(!vk_matmul_qt(&l->o, out, ctx, S))
 #endif
@@ -3803,6 +3811,25 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
     }
 #endif
     if(!shared_cuda){
+#ifdef COLI_VULKAN
+        /* Whole shared expert as ONE fused submit (gate+up+silu -> down, hidden on-device)
+         * via the expert-group primitive with count=1 — replaces 3 separate VK matmuls
+         * (x read once, 1 fence instead of 3). Falls through to the per-matmul chain. */
+        int fsh=l->sh_gate.fmt;
+        if(g_vk_dense && !omp_in_parallel() && (fsh==1||fsh==2) &&
+           l->sh_up.fmt==fsh && l->sh_down.fmt==fsh){
+            #define SW_(t) ((t).fmt==1?(const void*)(t).q8:(const void*)(t).q4)
+            if(coli_vk_tensor_ensure(&l->sh_gate.vk,SW_(l->sh_gate),l->sh_gate.s,fsh,D,sI)&&
+               coli_vk_tensor_ensure(&l->sh_up.vk,  SW_(l->sh_up),  l->sh_up.s,  fsh,D,sI)&&
+               coli_vk_tensor_ensure(&l->sh_down.vk,SW_(l->sh_down),l->sh_down.s,fsh,sI,D)){
+                ColiVkTensor *vg=l->sh_gate.vk,*vu=l->sh_up.vk,*vd=l->sh_down.vk;
+                int rows1[1]={S};
+                if(coli_vk_expert_group(&vg,&vu,&vd,rows1,1,hh,x)) shared_cuda=1;
+            }
+            #undef SW_
+        }
+        if(!shared_cuda){
+#endif
         sg=falloc((int64_t)S*sI);su=falloc((int64_t)S*sI);
 #ifdef COLI_VULKAN
         if(!vk_matmul_qt(&l->sh_gate, sg, x, S))
@@ -3817,6 +3844,9 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
         if(!vk_matmul_qt(&l->sh_down, hh, sg, S))
 #endif
         matmul_qt(hh, sg, &l->sh_down, S);
+#ifdef COLI_VULKAN
+        }
+#endif
     }
     if(shared_cuda!=2) for(int64_t z=0;z<(int64_t)S*D;z++) out[z]+=hh[z];
     free(sg); free(su);
