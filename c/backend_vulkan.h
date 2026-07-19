@@ -47,6 +47,13 @@ int  coli_vk_gate_up(ColiVkTensor **gate, ColiVkTensor **up,
 int  coli_vk_expert_group(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
                           ColiVkTensor *const *downs, const int *rows, int count,
                           float *y, const float *x);
+/* Async form: _issue submits the group and returns immediately (one in flight max);
+ * the caller computes its CPU share, then _take joins and reads back the packed y.
+ * Both return 0 on failure (caller computes those experts on the CPU instead). */
+int  coli_vk_expert_group_issue(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
+                                ColiVkTensor *const *downs, const int *rows, int count,
+                                const float *x);
+int  coli_vk_expert_group_take(float *y);
 
 /* Upload a resident tensor without computing (expert tier: gate/up/down uploaded once,
  * then driven by coli_vk_expert_group). Returns 0 on failure/unsupported fmt. */

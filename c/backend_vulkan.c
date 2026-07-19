@@ -69,6 +69,11 @@ static struct {
      * one submit with hidden never leaving the GPU. */
     Scratch eg_x, eg_h, eg_y;
     VkDescriptorPool eg_pool; VkDescriptorSet eg_gu[64], eg_dn[64]; int eg_nsets;
+    /* expert-group ASYNC state: its own command buffer + fence so an in-flight group
+     * never collides with the main cmd/fence (dense matmuls, absorb) — issue() returns
+     * immediately, the CPU computes its share, take() joins. */
+    VkCommandBuffer eg_cmd; VkFence eg_fence; int eg_inflight; size_t eg_pending_yb;
+    double eg_t0, eg_t1, eg_t2, eg_t3; int eg_prof;
     Scratch att_sc;              /* attention score scratch (GPU-only) */
     Scratch att_ctx;             /* fused absorb+o: ctx stays on device (GPU-only) */
     Scratch y2;                  /* second output of the fused matmul pair (readback) */
@@ -287,8 +292,10 @@ int coli_vk_init(const char *spv_path) {
     VkCommandBufferAllocateInfo cbi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
         .commandPool = G.cpool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
     VKCHECK(vkAllocateCommandBuffers(G.dev, &cbi, &G.cmd), "cmdBuf");
+    VKCHECK(vkAllocateCommandBuffers(G.dev, &cbi, &G.eg_cmd), "eg cmdBuf");
     VkFenceCreateInfo fi = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     VKCHECK(vkCreateFence(G.dev, &fi, NULL, &G.fence), "fence");
+    VKCHECK(vkCreateFence(G.dev, &fi, NULL, &G.eg_fence), "eg fence");
 
     G.ready = 1;
     VkPhysicalDeviceProperties p; vkGetPhysicalDeviceProperties(G.phys, &p);
@@ -455,13 +462,16 @@ static void wr_desc(VkDescriptorSet set, int n, const VkDescriptorBufferInfo *bi
     vkUpdateDescriptorSets(G.dev, (uint32_t)n, w, 0, NULL);
 }
 
-/* Full batched expert MLP for `count` experts in ONE submit, hidden staying on-device:
+/* Full batched expert MLP for `count` experts, hidden staying on-device:
  * for each c, hidden_c = silu(gate_c(x_c))*up_c(x_c) (fused), then y_c = down_c(hidden_c).
  * x/y are packed [sum(rows)*D]; experts are resident VkTensors (gate/up: D->I, down: I->D).
- * Mirrors coli_cuda_expert_group. Returns 0 -> caller falls back to CPU. */
-int coli_vk_expert_group(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
-                         ColiVkTensor *const *downs, const int *rows, int count,
-                         float *y, const float *x) {
+ * Mirrors coli_cuda_expert_group. Split into prepare+submit / take so the caller can
+ * overlap the GPU batch with its own CPU share (issue -> CPU rows -> take); the group
+ * runs on its OWN command buffer + fence, so in-flight work never collides with the
+ * main pipeline (dense matmuls, absorb attention). Returns 0 -> caller falls back. */
+static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
+                             ColiVkTensor *const *downs, const int *rows, int count,
+                             const float *x) {
     if (!G.ready || !G.shader_gu || count < 1 || count > 64) return 0;
     ColiVkTensor *g0 = gates[0]; if (!g0) return 0;
     int D = g0->I, I = g0->O, fmt = g0->fmt, total = 0, off[64];
@@ -474,10 +484,10 @@ int coli_vk_expert_group(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
     size_t xb = (size_t)total*D*4, hb = (size_t)total*I*4, yb = (size_t)total*D*4;
     if (!scratch_reserve(&G.eg_x, xb) || !scratch_reserve(&G.eg_h, hb) ||
         !scratch_reserve_mt(&G.eg_y, yb, G.memtype_cached)) return 0;   /* eg_y is read back -> cached */
-    int prof = getenv("VK_PROF") != NULL; double t0=0,t1=0,t2=0,t3=0,t4=0,t5=0;
-    if (prof) t0 = vk_now();
+    G.eg_prof = getenv("VK_PROF") != NULL;
+    if (G.eg_prof) G.eg_t0 = vk_now();
     memcpy(G.eg_x.ptr, x, xb);
-    if (prof) t1 = vk_now();
+    if (G.eg_prof) G.eg_t1 = vk_now();
 
     if (!G.eg_pool) {   /* one-time: 64 gate_up (6-binding) + 64 down (4-binding) sets */
         VkDescriptorPoolSize ps = {.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 64*6 + 64*4};
@@ -503,43 +513,73 @@ int coli_vk_expert_group(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
             {downs[c]->sbuf, 0, VK_WHOLE_SIZE}, {G.eg_y.buf, yo, (VkDeviceSize)rows[c]*D*4}};
         wr_desc(G.eg_dn[c], 4, di);
     }
-    if (prof) t2 = vk_now();
+    if (G.eg_prof) G.eg_t2 = vk_now();
 
-    VKCHECK(vkResetCommandBuffer(G.cmd, 0), "resetCmd");
+    VKCHECK(vkResetCommandBuffer(G.eg_cmd, 0), "eg resetCmd");
     VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-    VKCHECK(vkBeginCommandBuffer(G.cmd, &begin), "beginCmd");
+    VKCHECK(vkBeginCommandBuffer(G.eg_cmd, &begin), "eg beginCmd");
     VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT};
     /* phase 1: fused gate+up+silu -> hidden (per expert, bound to its x/hidden slices) */
-    vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_gu);
+    vkCmdBindPipeline(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_gu);
     for (int c = 0; c < count; c++) {
         struct PC pc = {fmt, rows[c], D, I, gates[c]->rowWords};
-        vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_gu, 0, 1, &G.eg_gu[c], 0, NULL);
-        vkCmdPushConstants(G.cmd, G.plyt_gu, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-        vkCmdDispatch(G.cmd, (uint32_t)((I + 7) / 8), (uint32_t)rows[c], 1);
+        vkCmdBindDescriptorSets(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_gu, 0, 1, &G.eg_gu[c], 0, NULL);
+        vkCmdPushConstants(G.eg_cmd, G.plyt_gu, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+        vkCmdDispatch(G.eg_cmd, (uint32_t)((I + 7) / 8), (uint32_t)rows[c], 1);
     }
-    vkCmdPipelineBarrier(G.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+    vkCmdPipelineBarrier(G.eg_cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
     /* phase 2: down projection hidden -> y */
-    vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe);
+    vkCmdBindPipeline(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe);
     for (int c = 0; c < count; c++) {
         struct PC pc = {fmt, rows[c], I, D, downs[c]->rowWords};
-        vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt, 0, 1, &G.eg_dn[c], 0, NULL);
-        vkCmdPushConstants(G.cmd, G.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-        vkCmdDispatch(G.cmd, (uint32_t)((D + 7) / 8), (uint32_t)rows[c], 1);
+        vkCmdBindDescriptorSets(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt, 0, 1, &G.eg_dn[c], 0, NULL);
+        vkCmdPushConstants(G.eg_cmd, G.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+        vkCmdDispatch(G.eg_cmd, (uint32_t)((D + 7) / 8), (uint32_t)rows[c], 1);
     }
-    VKCHECK(vkEndCommandBuffer(G.cmd), "endCmd");
-    if (prof) t3 = vk_now();
+    VKCHECK(vkEndCommandBuffer(G.eg_cmd), "eg endCmd");
+    if (G.eg_prof) G.eg_t3 = vk_now();
 
-    VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd};
-    VKCHECK(vkResetFences(G.dev, 1, &G.fence), "resetFence");
-    VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.fence), "queueSubmit");
-    if (vkWaitForFences(G.dev, 1, &G.fence, VK_TRUE, 10000000000ULL) != VK_SUCCESS) { G.ready = 0; return 0; }
-    if (prof) t4 = vk_now();
-    memcpy(y, G.eg_y.ptr, yb);
-    if (prof) { t5 = vk_now();
-        fprintf(stderr, "[VK_PROF] K=%d memcpy_x %.3f | desc %.3f | record %.3f | gpu %.3f | memcpy_y %.3f ms\n",
-                count, t1-t0, t2-t1, t3-t2, t4-t3, t5-t4); }
-    G.cmd_ready = 0; G.bound_tensor = NULL;
+    VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.eg_cmd};
+    VKCHECK(vkResetFences(G.dev, 1, &G.eg_fence), "eg resetFence");
+    VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.eg_fence), "eg queueSubmit");
+    G.eg_pending_yb = yb; G.eg_inflight = 1;
     return 1;
+}
+
+/* Issue a group asynchronously: submit and return WITHOUT waiting, so the caller
+ * computes its CPU share concurrently. Exactly one group may be in flight. */
+int coli_vk_expert_group_issue(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
+                               ColiVkTensor *const *downs, const int *rows, int count,
+                               const float *x) {
+    if (G.eg_inflight) return 0;
+    return eg_prepare_submit(gates, ups, downs, rows, count, x);
+}
+
+/* Join the in-flight group and read back the packed outputs. */
+int coli_vk_expert_group_take(float *y) {
+    if (!G.eg_inflight) return 0;
+    G.eg_inflight = 0;
+    if (vkWaitForFences(G.dev, 1, &G.eg_fence, VK_TRUE, 10000000000ULL) != VK_SUCCESS) {
+        fprintf(stderr, "[VK] expert-group fence wait failed — disabling GPU offload\n");
+        G.ready = 0; return 0;
+    }
+    double t4 = G.eg_prof ? vk_now() : 0;
+    memcpy(y, G.eg_y.ptr, G.eg_pending_yb);
+    if (G.eg_prof) {
+        double t5 = vk_now();
+        fprintf(stderr, "[VK_PROF] memcpy_x %.3f | desc %.3f | record %.3f | issue->take %.3f | memcpy_y %.3f ms\n",
+                G.eg_t1-G.eg_t0, G.eg_t2-G.eg_t1, G.eg_t3-G.eg_t2, t4-G.eg_t3, t5-t4);
+    }
+    return 1;
+}
+
+/* Synchronous form (shared expert, harness): issue + take in one call. */
+int coli_vk_expert_group(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
+                         ColiVkTensor *const *downs, const int *rows, int count,
+                         float *y, const float *x) {
+    if (G.eg_inflight) return 0;
+    if (!eg_prepare_submit(gates, ups, downs, rows, count, x)) return 0;
+    return coli_vk_expert_group_take(y);
 }
 
 /* ---- MLA absorb attention core -------------------------------------------------
@@ -798,6 +838,7 @@ void coli_vk_shutdown(void) {
     coli_vk_kv_reset();
     if (G.eg_pool) vkDestroyDescriptorPool(G.dev, G.eg_pool, NULL);
     vkDestroyFence(G.dev, G.fence, NULL);
+    vkDestroyFence(G.dev, G.eg_fence, NULL);
     vkDestroyCommandPool(G.dev, G.cpool, NULL);
     vkDestroyDescriptorPool(G.dev, G.dpool, NULL);
     vkDestroyPipeline(G.dev, G.pipe, NULL);
@@ -1056,16 +1097,28 @@ static int run_expert_group(int fmt, int D, int I, int K) {
     }
     double maxrel = 0;
     for (int i = 0; i < K*D; i++) { double e = fabs(yg[i]-yc[i]); if (fabs(yc[i])>1e-2) { double r = e/fabs(yc[i]); if (r>maxrel) maxrel = r; } }
-    coli_vk_expert_group(tg, tu, td, rows, K, yg, x);   /* warm + leaves G.cmd recorded */
+    coli_vk_expert_group(tg, tu, td, rows, K, yg, x);   /* warm + leaves G.eg_cmd recorded */
+    /* async issue/take must reproduce the sync result exactly (same buffers/records) */
+    {
+        float *ya = malloc((size_t)K*D*4);
+        if (!coli_vk_expert_group_issue(tg, tu, td, rows, K, x) || !coli_vk_expert_group_take(ya)) {
+            printf("expert_group issue/take failed\n"); maxrel = 1;
+        } else {
+            double amr = 0;
+            for (int i = 0; i < K*D; i++) { double e = fabs(ya[i]-yg[i]); if (fabs(yg[i])>1e-2) { double r = e/fabs(yg[i]); if (r>amr) amr = r; } }
+            if (amr > 1e-6) { printf("issue/take deviates from sync: %.4g\n", amr); maxrel = 1; }
+        }
+        free(ya);
+    }
     int iters = 20; double t0 = now();
     for (int k = 0; k < iters; k++) coli_vk_expert_group(tg, tu, td, rows, K, yg, x);
     double ms = (now()-t0)*1000.0/iters/K;
     /* GPU-only: re-submit the already-recorded command buffer (skips per-call host setup:
      * descriptor updates + recording), isolating raw GPU throughput. */
-    VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd};
-    for (int w = 0; w < 2; w++) { vkResetFences(G.dev,1,&G.fence); vkQueueSubmit(G.queue,1,&si,G.fence); vkWaitForFences(G.dev,1,&G.fence,VK_TRUE,10000000000ULL); }
+    VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.eg_cmd};
+    for (int w = 0; w < 2; w++) { vkResetFences(G.dev,1,&G.eg_fence); vkQueueSubmit(G.queue,1,&si,G.eg_fence); vkWaitForFences(G.dev,1,&G.eg_fence,VK_TRUE,10000000000ULL); }
     double g0 = now();
-    for (int k = 0; k < iters; k++) { vkResetFences(G.dev,1,&G.fence); vkQueueSubmit(G.queue,1,&si,G.fence); vkWaitForFences(G.dev,1,&G.fence,VK_TRUE,10000000000ULL); }
+    for (int k = 0; k < iters; k++) { vkResetFences(G.dev,1,&G.eg_fence); vkQueueSubmit(G.queue,1,&si,G.eg_fence); vkWaitForFences(G.dev,1,&G.eg_fence,VK_TRUE,10000000000ULL); }
     double gpums = (now()-g0)*1000.0/iters/K;
     printf("FULL VK expert_group fmt=%d %2d experts | maxrel=%.4g | per-call %.4f  GPU-only %.4f ms/expert (ROCm 0.179)\n",
            fmt, K, maxrel, ms, gpums);

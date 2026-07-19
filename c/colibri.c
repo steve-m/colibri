@@ -288,8 +288,16 @@ static int g_repin;
 static uint64_t g_last_repin;
 #ifdef COLI_VULKAN
 static int g_vulkan;          /* COLI_VULKAN=1: compute routed experts on the Vulkan tier */
-static int g_vk_budget;       /* COLI_VK_EXPERTS: max experts uploaded to VK VRAM (default 1024) */
+static int g_vk_budget;       /* COLI_VK_EXPERTS: pinned VK expert tier size (0 = tier off) */
 static int g_vk_resident;     /* how many experts currently VK-resident */
+/* Pinned VK expert tier: top heat-ranked routed experts uploaded ONCE at startup into a
+ * registry keyed by (layer,eid), decoupled from the RAM cache slots — stable residency
+ * (no LRU churn, no uploads on the decode critical path), mirroring the HIP VRAM tier. */
+static struct ColiVkTensor **g_vk_reg;   /* [(layer*E+eid)*3 + {gate,up,down}] */
+static int g_vk_reg_n, g_vk_reg_E;
+static inline struct ColiVkTensor **vk_reg_at(int layer,int eid){
+    return g_vk_reg ? &g_vk_reg[((size_t)layer*g_vk_reg_E+eid)*3] : NULL;
+}
 static int g_vk_dense;        /* COLI_VK_DENSE=1: run the resident dense matmuls (attention
                                * projections + shared expert) on Vulkan too */
 static int g_vk_attn;         /* COLI_VK_ATTN=1: run the MLA absorb attention core on Vulkan
@@ -3259,8 +3267,8 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
 #endif
     int vk_active = 0; (void)vk_active;
 #ifdef COLI_VULKAN
-    vk_active = g_vulkan && g_vk_budget>0 && !omp_in_parallel() && S<=4;   /* budget 0 = tier off,
-                                                * experts stay on the normal (parallel) CPU loop */
+    vk_active = g_vulkan && g_vk_reg_n>0 && !omp_in_parallel() && S<=4;   /* empty registry (tier
+                                                * off / no usage history) = normal CPU expert loop */
     float *vk_xh = vk_active?falloc((int64_t)S*K*D):NULL;
     float *vk_yh = vk_active?falloc((int64_t)S*K*D):NULL;
 #endif
@@ -3542,57 +3550,60 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
          * coli_vk_expert_group (fused gate+up+silu -> down, on-device); the rest + misses
          * fall back to the CPU below. Decode-only (S<=4). Measured ~35% faster than ROCm. */
         if(vk_active && !metal_done){
-            ColiVkTensor *vg[64],*vu[64],*vd[64]; ESlot *ve[64]; int vrows[64], voff[64], vrmap[64*4]; float vwmap[64*4];
-            ESlot *ce[64]; int cnr[64], crmap[64*4]; float cwmap[64*4];
+            /* Pinned+async VK expert tier. Pass 1 partitions by REGISTRY residency (the
+             * heat-pinned startup uploads — no uploads, no loads here); pass 2 ISSUES the
+             * GPU batch async and computes the CPU share while it runs; pass 3 drains the
+             * pipe + RAM-loads the GPU-side slots (cache invariants: every dispatched slot
+             * waited, every use[] slot loaded before the end-of-block LRU swap); pass 4
+             * takes the GPU results (fallback: recompute those rows on the CPU). */
+            ColiVkTensor *vg[64],*vu[64],*vd[64]; ESlot *ve[64]; int vrows[64], voff[64], vrmap[64*4]; float vwmap[64*4]; int vqof[64];
+            ESlot *ce[64]; int cnr[64], crmap[64*4]; float cwmap[64*4]; int cqof[64];
             int nvk=0, vtot=0, ncpu=0;
             double t0=now_s();
             for(int j=0;j<nb;j++){ int eid=uniq[base+j]; ESlot *e=use[j];
-                if(g_pipe && qof[j]>=0){ double tw=now_s(); pipe_wait(qof[j]); m->t_ewait += now_s()-tw; }
                 int nr=0;
                 for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++)
                     if(idxs[(int64_t)s*K+kk]==eid){ rows[nr]=s; rw[nr]=ws[(int64_t)s*K+kk]; nr++; break; }
-                if(!nr) continue;
-                if(!e->slab) expert_load(m,layer,e->eid,e,1);
-                int elig = e->slab && e->g.fmt==2 && e->u.fmt==2 && e->d.fmt==2 && nvk<64 && (vtot+nr)<=S*K;
-                if(elig && !e->g.vk_eligible && g_vk_resident < g_vk_budget
-                   && (uint8_t*)e->g.q4>=e->slab && (uint8_t*)e->d.q4>=e->slab){
-                    if(coli_vk_tensor_ensure(&e->g.vk,e->g.q4,e->g.s,2,D,I)
-                       && coli_vk_tensor_ensure(&e->u.vk,e->u.q4,e->u.s,2,D,I)
-                       && coli_vk_tensor_ensure(&e->d.vk,e->d.q4,e->d.s,2,I,D)){
-                        e->g.vk_eligible=e->u.vk_eligible=e->d.vk_eligible=1; g_vk_resident++;
-                    }
-                }
-                if(elig && e->g.vk_eligible){
+                if(!nr){ if(g_pipe && qof[j]>=0){ double tw=now_s(); pipe_wait(qof[j]); m->t_ewait += now_s()-tw; } continue; }
+                ColiVkTensor **reg = layer<c->n_layers ? vk_reg_at(layer,eid) : NULL;
+                if(reg && reg[0] && nvk<64 && (vtot+nr)<=S*K){
                     voff[nvk]=vtot;
                     for(int r=0;r<nr;r++){ memcpy(vk_xh+(int64_t)(vtot+r)*D, x+(int64_t)rows[r]*D, D*sizeof(float));
                         vrmap[nvk*S+r]=rows[r]; vwmap[nvk*S+r]=rw[r]; }
-                    vg[nvk]=e->g.vk; vu[nvk]=e->u.vk; vd[nvk]=e->d.vk; ve[nvk]=e; vrows[nvk]=nr; vtot+=nr; nvk++;
+                    vg[nvk]=reg[0]; vu[nvk]=reg[1]; vd[nvk]=reg[2]; ve[nvk]=e; vrows[nvk]=nr; vqof[nvk]=qof[j]; vtot+=nr; nvk++;
                 } else {
-                    ce[ncpu]=e; cnr[ncpu]=nr;
+                    ce[ncpu]=e; cnr[ncpu]=nr; cqof[ncpu]=qof[j];
                     for(int r=0;r<nr;r++){ crmap[ncpu*S+r]=rows[r]; cwmap[ncpu*S+r]=rw[r]; }
                     ncpu++;
                 }
             }
-            int vk_ok = nvk>0 && coli_vk_expert_group(vg,vu,vd,vrows,nvk,vk_yh,vk_xh);
-            for(int c=0;c<ncpu;c++){ ESlot *e=ce[c]; int nr=cnr[c];
-                for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D, x+(int64_t)crmap[c*S+r]*D, D*sizeof(float));
+            int vk_issued = nvk>0 && coli_vk_expert_group_issue(vg,vu,vd,vrows,nvk,vk_xh);
+            for(int c2=0;c2<ncpu;c2++){ ESlot *e=ce[c2]; int nr=cnr[c2];
+                if(g_pipe && cqof[c2]>=0){ double tw=now_s(); pipe_wait(cqof[c2]); m->t_ewait += now_s()-tw; }
+                if(!e->slab) expert_load(m,layer,e->eid,e,1);
+                for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D, x+(int64_t)crmap[c2*S+r]*D, D*sizeof(float));
                 expert_gate_up(gg,uu,xg,&e->g,&e->u,nr);
                 for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
                 matmul_qt(hh, gg, &e->d, nr);
-                for(int r=0;r<nr;r++){ float *os=out+(int64_t)crmap[c*S+r]*D, wgt=cwmap[c*S+r], *hr=hh+(int64_t)r*D;
+                for(int r=0;r<nr;r++){ float *os=out+(int64_t)crmap[c2*S+r]*D, wgt=cwmap[c2*S+r], *hr=hh+(int64_t)r*D;
                     for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
             }
-            for(int c=0;c<nvk;c++){ int nr=vrows[c];
-                if(vk_ok){ int o=voff[c];
-                    for(int r=0;r<nr;r++){ float *os=out+(int64_t)vrmap[c*S+r]*D, wgt=vwmap[c*S+r], *src=vk_yh+(int64_t)(o+r)*D;
+            for(int c2=0;c2<nvk;c2++){
+                if(g_pipe && vqof[c2]>=0){ double tw=now_s(); pipe_wait(vqof[c2]); m->t_ewait += now_s()-tw; }
+                ESlot *e=ve[c2]; if(!e->slab) expert_load(m,layer,e->eid,e,1);
+            }
+            int vk_ok = vk_issued && coli_vk_expert_group_take(vk_yh);
+            for(int c2=0;c2<nvk;c2++){ int nr=vrows[c2];
+                if(vk_ok){ int o=voff[c2];
+                    for(int r=0;r<nr;r++){ float *os=out+(int64_t)vrmap[c2*S+r]*D, wgt=vwmap[c2*S+r], *src=vk_yh+(int64_t)(o+r)*D;
                         for(int d=0;d<D;d++) os[d]+=wgt*src[d]; }
-                } else {   /* group failed: recompute this expert's rows on the CPU via its ESlot */
-                    ESlot *e=ve[c];
-                    for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D, x+(int64_t)vrmap[c*S+r]*D, D*sizeof(float));
+                } else {   /* issue/take failed: recompute this expert's rows on the CPU */
+                    ESlot *e=ve[c2];
+                    for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D, x+(int64_t)vrmap[c2*S+r]*D, D*sizeof(float));
                     expert_gate_up(gg,uu,xg,&e->g,&e->u,nr);
                     for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
                     matmul_qt(hh, gg, &e->d, nr);
-                    for(int r=0;r<nr;r++){ float *os=out+(int64_t)vrmap[c*S+r]*D, wgt=vwmap[c*S+r], *hr=hh+(int64_t)r*D;
+                    for(int r=0;r<nr;r++){ float *os=out+(int64_t)vrmap[c2*S+r]*D, wgt=vwmap[c2*S+r], *hr=hh+(int64_t)r*D;
                         for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
                 }
             }
@@ -6209,6 +6220,57 @@ static int *read_arr(jval*o,const char*k,int*n){
 
 /* telemetry, stats, usage persistence — moved to telemetry.h */
 
+#ifdef COLI_VULKAN
+/* Pinned VK expert tier fill: upload the top-COLI_VK_EXPERTS heat-ranked routed experts
+ * ONCE at startup (mirrors the HIP VRAM tier: stable residency, zero uploads at decode).
+ * Ranking comes from the persistent usage history; already-pinned RAM slots feed the
+ * upload directly, the rest stream through one transient slot and are freed after. */
+typedef struct { uint32_t u; int layer, eid; } VkCand;
+static int vk_cand_cmp(const void *a, const void *b){
+    uint32_t ua=((const VkCand*)a)->u, ub=((const VkCand*)b)->u;
+    return ua<ub ? 1 : ua>ub ? -1 : 0;
+}
+static void vk_registry_fill(Model *m){
+    Cfg *c=&m->c; int E=c->n_experts, NL=c->n_layers;
+    if(!g_vulkan || g_vk_budget<=0) return;
+    int64_t nz=0;
+    for(int i=0;i<NL;i++) if(m->eusage[i]) for(int e=0;e<E;e++) if(m->eusage[i][e]) nz++;
+    if(!nz){ fprintf(stderr,"[VK] expert tier: no usage history yet — tier empty this run "
+                     "(it seeds from %s as you use the model)\n", g_usage_path); return; }
+    VkCand *cand=malloc((size_t)nz*sizeof(VkCand)); if(!cand) return;
+    int64_t n=0;
+    for(int i=0;i<NL;i++) if(m->eusage[i]) for(int e=0;e<E;e++)
+        if(m->eusage[i][e]) cand[n++]=(VkCand){m->eusage[i][e],i,e};
+    qsort(cand,(size_t)n,sizeof(VkCand),vk_cand_cmp);
+    g_vk_reg=calloc((size_t)NL*E*3,sizeof(*g_vk_reg)); g_vk_reg_E=E;
+    if(!g_vk_reg){ free(cand); return; }
+    ESlot tmp; memset(&tmp,0,sizeof(tmp)); tmp.eid=-1;
+    double t0=now_s(); int64_t bytes=0; int tried=0;
+    for(int64_t i2=0;i2<n && g_vk_reg_n<g_vk_budget;i2++){
+        int layer=cand[i2].layer, eid=cand[i2].eid; tried++;
+        ESlot *src=NULL, *P=m->pin[layer];
+        for(int z=0;z<m->npin[layer];z++) if(P[z].eid==eid && P[z].slab){ src=&P[z]; break; }
+        if(!src){ if(!expert_load(m,layer,eid,&tmp,0)) continue; src=&tmp; }
+        if(src->g.fmt!=2||src->u.fmt!=2||src->d.fmt!=2) continue;   /* int4 tier only */
+        ColiVkTensor **slot=vk_reg_at(layer,eid);
+        if(!coli_vk_tensor_ensure(&slot[0],src->g.q4,src->g.s,2,c->hidden,c->moe_inter)||
+           !coli_vk_tensor_ensure(&slot[1],src->u.q4,src->u.s,2,c->hidden,c->moe_inter)||
+           !coli_vk_tensor_ensure(&slot[2],src->d.q4,src->d.s,2,c->moe_inter,c->hidden)){
+            if(slot[0]){coli_vk_tensor_free(slot[0]);slot[0]=NULL;}
+            if(slot[1]){coli_vk_tensor_free(slot[1]);slot[1]=NULL;}
+            fprintf(stderr,"[VK] expert tier: VRAM full after %d experts\n",g_vk_reg_n);
+            break;
+        }
+        bytes+=coli_vk_tensor_bytes(slot[0])+coli_vk_tensor_bytes(slot[1])+coli_vk_tensor_bytes(slot[2]);
+        g_vk_reg_n++;
+    }
+    if(tmp.slab){ compat_aligned_free(tmp.slab); free(tmp.fslab); }
+    free(cand);
+    fprintf(stderr,"[VK] expert tier: %d hot experts resident (%.2f GB VRAM, %.1fs, top-%d of history)\n",
+            g_vk_reg_n,bytes/1e9,now_s()-t0,tried);
+}
+#endif
+
 /* HOT-STORE ("il redis del colibri'"): carica in RAM, UNA VOLTA e per sempre, i top expert
  * per frequenza d'uso misurata (file STATS di un run precedente), entro un budget in GB.
  * Ogni hit evita una lettura dal disco lento. */
@@ -7178,6 +7240,9 @@ int main(int argc, char **argv){
       cap_for_ram(&m, ram_env, ebits, est_ctx);
       g_prof = getenv("PROF")?atoi(getenv("PROF")):0;   /* PROF=1: opt-in performance profile */
       if(g_prof) prof_config(&m, ram_env, est_ctx); }
+#ifdef COLI_VULKAN
+    vk_registry_fill(&m);   /* pinned VK expert tier: needs the usage history loaded above */
+#endif
     const char *stats=getenv("STATS");   /* STATS=<file> -> istogramma uso expert a fine run */
 
     /* modo scoring per benchmark: SCORE=<requests.txt> -> log-likelihood per riga */
