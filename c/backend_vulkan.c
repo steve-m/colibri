@@ -1325,33 +1325,37 @@ int main(int argc, char **argv) {
     bad |= run_expert_group(2, 6144, 2048, 1);
     bad |= run_expert_group(2, 6144, 2048, 8);
     bad |= run_expert_group(2, 6144, 2048, 32);
-    /* int3-g64 expert group: correctness + the 0.86x-bytes throughput question */
+    /* int3-g64 expert group: correctness + the 0.86x-bytes throughput question.
+     * count=1 included — it is the SHARED-expert path shape in the engine. */
+    bad |= run_expert_group(5, 6144, 2048, 1);
     bad |= run_expert_group(5, 6144, 2048, 8);
     bad |= run_expert_group(5, 6144, 2048, 32);
-    /* Fused same-input matmul pair (the q_a + kv_a prologue pattern). */
-    {
+    /* Fused same-input matmul pair (the q_a + kv_a prologue pattern), int4 AND int3. */
+    for (int pi = 0; pi < 2; pi++) {
+        int pf = pi == 0 ? 2 : 5;
         int I = 6144, O1 = 2048, O2 = 576, S = 1;
-        size_t rb = (size_t)(I + 1) / 2;
+        size_t rb = ref_rowbytes(pf, I);
+        size_t n1 = ref_scales(pf, I, O1), n2 = ref_scales(pf, I, O2);
         uint8_t *w1 = malloc(rb * O1), *w2 = malloc(rb * O2);
-        float *s1 = malloc((size_t)O1 * 4), *s2 = malloc((size_t)O2 * 4), *x = malloc((size_t)I * 4);
+        float *s1 = malloc(n1 * 4), *s2 = malloc(n2 * 4), *x = malloc((size_t)I * 4);
         float *y1 = malloc((size_t)O1 * 4), *y2 = malloc((size_t)O2 * 4);
         float *c1 = malloc((size_t)O1 * 4), *c2 = malloc((size_t)O2 * 4);
         for (size_t i = 0; i < rb * (size_t)O1; i++) w1[i] = rand() & 0xff;
         for (size_t i = 0; i < rb * (size_t)O2; i++) w2[i] = rand() & 0xff;
-        for (int o = 0; o < O1; o++) s1[o] = 0.01f + (rand() % 100) / 10000.0f;
-        for (int o = 0; o < O2; o++) s2[o] = 0.01f + (rand() % 100) / 10000.0f;
+        for (size_t o = 0; o < n1; o++) s1[o] = 0.01f + (rand() % 100) / 10000.0f;
+        for (size_t o = 0; o < n2; o++) s2[o] = 0.01f + (rand() % 100) / 10000.0f;
         for (int i = 0; i < I; i++) x[i] = (rand() % 200 - 100) / 100.0f;
         ColiVkTensor *t1 = NULL, *t2 = NULL;
-        if (!coli_vk_matmul_pair(&t1, y1, w1, s1, O1, &t2, y2, w2, s2, O2, 2, x, S, I)) {
-            printf("matmul_pair failed\n"); bad = 1;
+        if (!coli_vk_matmul_pair(&t1, y1, w1, s1, O1, &t2, y2, w2, s2, O2, pf, x, S, I)) {
+            printf("matmul_pair fmt=%d failed\n", pf); bad = 1;
         } else {
-            cpu_ref(c1, x, w1, s1, 2, S, I, O1); cpu_ref(c2, x, w2, s2, 2, S, I, O2);
+            cpu_ref(c1, x, w1, s1, pf, S, I, O1); cpu_ref(c2, x, w2, s2, pf, S, I, O2);
             double mr = 0;
             for (int i = 0; i < O1; i++) { double e = fabs(y1[i]-c1[i]); if (fabs(c1[i])>1e-2) { double r=e/fabs(c1[i]); if (r>mr) mr=r; } }
             for (int i = 0; i < O2; i++) { double e = fabs(y2[i]-c2[i]); if (fabs(c2[i])>1e-2) { double r=e/fabs(c2[i]); if (r>mr) mr=r; } }
             double t0 = now();
-            for (int k = 0; k < 30; k++) coli_vk_matmul_pair(&t1, y1, w1, s1, O1, &t2, y2, w2, s2, O2, 2, x, S, I);
-            printf("matmul_pair 6144->(2048,576)          | maxrel=%.4g | %.3f ms/pair-call\n", mr, (now()-t0)*1000/30);
+            for (int k = 0; k < 30; k++) coli_vk_matmul_pair(&t1, y1, w1, s1, O1, &t2, y2, w2, s2, O2, pf, x, S, I);
+            printf("matmul_pair fmt=%d 6144->(2048,576)   | maxrel=%.4g | %.3f ms/pair-call\n", pf, mr, (now()-t0)*1000/30);
             bad |= mr > 1e-3;
         }
         coli_vk_tensor_free(t1); coli_vk_tensor_free(t2);

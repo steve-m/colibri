@@ -3570,7 +3570,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             }
         }
 #ifdef COLI_VULKAN
-        /* Vulkan expert tier (COLI_VULKAN=1): upload routed int4 experts to the GPU once
+        /* Vulkan expert tier (COLI_VULKAN=1): upload routed int4/int3-g64 experts to the GPU once
          * (capped by COLI_VK_EXPERTS), then compute the resident ones as one batched
          * coli_vk_expert_group (fused gate+up+silu -> down, on-device); the rest + misses
          * fall back to the CPU below. Decode-only (S<=4). Measured ~35% faster than ROCm. */
@@ -7120,7 +7120,7 @@ int main(int argc, char **argv){
         g_vk_budget = getenv("COLI_VK_EXPERTS") ? atoi(getenv("COLI_VK_EXPERTS")) : 320;
         g_vk_dense = getenv("COLI_VK_DENSE") ? atoi(getenv("COLI_VK_DENSE")) : 0;
         g_vk_attn = getenv("COLI_VK_ATTN") ? atoi(getenv("COLI_VK_ATTN")) : 0;
-        fprintf(stderr,"[VK] expert tier active: routed int4 experts on the GPU (budget %d)%s%s\n",
+        fprintf(stderr,"[VK] expert tier active: routed quantized experts on the GPU (budget %d)%s%s\n",
                 g_vk_budget, g_vk_dense ? " + dense projections + shared expert" : "",
                 g_vk_attn ? " + absorb attention core" : "");
     }
