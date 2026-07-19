@@ -6284,13 +6284,19 @@ static void vk_registry_fill(Model *m){
     g_vk_reg=calloc((size_t)NL*E*3,sizeof(*g_vk_reg)); g_vk_reg_E=E; g_vk_reg_NL=NL;
     if(!g_vk_reg){ free(cand); return; }
     ESlot tmp; memset(&tmp,0,sizeof(tmp)); tmp.eid=-1;
-    double t0=now_s(); int64_t bytes=0; int tried=0;
+    double t0=now_s(); int64_t bytes=0; int tried=0, loadfail=0;
     for(int64_t i2=0;i2<n && g_vk_reg_n<g_vk_budget;i2++){
         int layer=cand[i2].layer, eid=cand[i2].eid; tried++;
         ESlot *src=NULL, *P=m->pin[layer];
         for(int z=0;z<m->npin[layer];z++) if(P[z].eid==eid && P[z].slab){ src=&P[z]; break; }
-        if(!src){ if(!expert_load(m,layer,eid,&tmp,0)) continue; src=&tmp; }
-        if(src->g.fmt!=2||src->u.fmt!=2||src->d.fmt!=2) continue;   /* int4 tier only */
+        if(!src){ if(expert_load(m,layer,eid,&tmp,0)!=0){   /* 0 = success (impl convention) */
+                if(++loadfail<4) fprintf(stderr,"[VK] tier fill: expert_load(%d,%d) failed\n",layer,eid);
+                if(loadfail>=64) break;                     /* disk trouble: stop burning time */
+                continue; } src=&tmp; }
+        if(src->g.fmt!=2||src->u.fmt!=2||src->d.fmt!=2){
+            if(tried<4) fprintf(stderr,"[VK] tier fill: (%d,%d) fmt %d/%d/%d != int4 (src=%s)\n",
+                layer,eid,src->g.fmt,src->u.fmt,src->d.fmt,src==&tmp?"load":"pin");
+            continue; }   /* int4 tier only */
         ColiVkTensor **slot=vk_reg_at(layer,eid);
         if(!coli_vk_tensor_ensure(&slot[0],src->g.q4,src->g.s,2,c->hidden,c->moe_inter)||
            !coli_vk_tensor_ensure(&slot[1],src->u.q4,src->u.s,2,c->hidden,c->moe_inter)||
