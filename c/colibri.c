@@ -331,16 +331,16 @@ static void qt_vk_reset(QT *t){
     t->vk_eligible=0;
 }
 /* Dense matmul on the Vulkan tier: y[S,O] = x[S,I] @ dequant(t)^T. Uploads the resident
- * int4/int8 weight once (t->vk), then reuses it. Returns 0 (caller runs the CPU matmul)
- * when VK-dense is off, the format is unsupported, or upload/compute fails. */
+ * int8/int4/int3-g64 weight once (t->vk), then reuses it. Returns 0 (caller runs the CPU
+ * matmul) when VK-dense is off, the format is unsupported, or upload/compute fails. */
 static int vk_matmul_qt(QT *t, float *y, const float *x, int S){
-    if(!g_vk_dense || (t->fmt!=1 && t->fmt!=2)) return 0;
+    if(!g_vk_dense || (t->fmt!=1 && t->fmt!=2 && t->fmt!=5)) return 0;
     const void *w = t->fmt==1 ? (const void*)t->q8 : (const void*)t->q4;
     return coli_vk_matmul(&t->vk, y, x, w, t->s, t->fmt, S, t->I, t->O);
 }
 /* Two same-input resident matmuls in one submit (q_a + kv_a read the same x). */
 static int vk_matmul_pair_qt(QT *a, float *ya, QT *b, float *yb, const float *x, int S){
-    if(!g_vk_dense || a->fmt!=b->fmt || (a->fmt!=1 && a->fmt!=2) || a->I!=b->I) return 0;
+    if(!g_vk_dense || a->fmt!=b->fmt || (a->fmt!=1 && a->fmt!=2 && a->fmt!=5) || a->I!=b->I) return 0;
     const void *wa = a->fmt==1 ? (const void*)a->q8 : (const void*)a->q4;
     const void *wb = b->fmt==1 ? (const void*)b->q8 : (const void*)b->q4;
     return coli_vk_matmul_pair(&a->vk, ya, wa, a->s, a->O,
@@ -859,7 +859,7 @@ static _Atomic long g_pilot_loads=0;     /* load cross-layer VERI completati (ba
 static _Atomic long g_pilot_drops=0;     /* predizioni scartate perche' il main possiede gia' il layer */
 /* format from `bits`: >=16 f32, 5..8 int8, 4 int4-packed, 3 int3-g64 (group scales), <=2 int2 */
 static void qt_alloc(QT *t, int O, int I, int bits){
-    t->O=O; t->I=I; t->qf=NULL; t->q8=NULL; t->q4=NULL; t->s=NULL;
+    t->O=O; t->I=I; t->gs=0; t->qf=NULL; t->q8=NULL; t->q4=NULL; t->s=NULL;
     if(bits>=16){ t->fmt=0; t->qf=falloc((int64_t)O*I); }
     else if(bits>=5 || g_nopack){ t->fmt=1; t->q8=qalloc((int64_t)O*I); t->s=qsalloc(O); }
     else if(bits>=4){ t->fmt=2; t->q4=qalloc((int64_t)O*((I+1)/2)); t->s=qsalloc(O); }
@@ -2728,7 +2728,7 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
          * on rewrite/rebind/resize). Falls back to CPU on DSA top-k selection, ragged KV,
          * the MTP layer, or any backend failure — output identical either way. */
         if(!cuda_core&&g_vk_attn&&!kvs&&!positions&&S<=4&&layer<c->n_layers&&
-           (l->kv_b.fmt==1||l->kv_b.fmt==2)&&kvl<=512&&c->qk_nope<=256&&c->qk_rope<=64&&
+           (l->kv_b.fmt==1||l->kv_b.fmt==2||l->kv_b.fmt==5)&&kvl<=512&&c->qk_nope<=256&&c->qk_rope<=64&&
            m->vk_kv_valid&&m->Lc[layer]&&m->Rc[layer]){   /* f32 KV only: a quantized-KV cache
                                                 * (upstream #399 KV8/TQ leaves Lc/Rc NULL)
                                                 * falls back to the CPU path until the VK
@@ -2744,7 +2744,7 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                     m->vk_kv_valid[layer]=T;
                     const void *kw=l->kv_b.fmt==1?(const void*)l->kv_b.q8:(const void*)l->kv_b.q4;
                     /* fused absorb + o-projection: ctx never leaves the device */
-                    if((l->o.fmt==1||l->o.fmt==2)&&
+                    if((l->o.fmt==1||l->o.fmt==2||l->o.fmt==5)&&
                        coli_vk_attention_absorb_project(&l->kv_b.vk,kw,l->kv_b.s,l->kv_b.fmt,
                             &l->o.vk,l->o.fmt==1?(const void*)l->o.q8:(const void*)l->o.q4,
                             l->o.s,l->o.fmt,out,Q,layer,S,H,c->qk_nope,c->qk_rope,
@@ -3869,7 +3869,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
          * via the expert-group primitive with count=1 — replaces 3 separate VK matmuls
          * (x read once, 1 fence instead of 3). Falls through to the per-matmul chain. */
         int fsh=l->sh_gate.fmt;
-        if(g_vk_dense && !omp_in_parallel() && (fsh==1||fsh==2) &&
+        if(g_vk_dense && !omp_in_parallel() && (fsh==1||fsh==2||fsh==5) &&
            l->sh_up.fmt==fsh && l->sh_down.fmt==fsh){
             #define SW_(t) ((t).fmt==1?(const void*)(t).q8:(const void*)(t).q4)
             if(coli_vk_tensor_ensure(&l->sh_gate.vk,SW_(l->sh_gate),l->sh_gate.s,fsh,D,sI)&&
@@ -6296,14 +6296,16 @@ static void vk_registry_fill(Model *m){
                 if(++loadfail<4) fprintf(stderr,"[VK] tier fill: expert_load(%d,%d) failed\n",layer,eid);
                 if(loadfail>=64) break;                     /* disk trouble: stop burning time */
                 continue; } src=&tmp; }
-        if(src->g.fmt!=2||src->u.fmt!=2||src->d.fmt!=2){
-            if(tried<4) fprintf(stderr,"[VK] tier fill: (%d,%d) fmt %d/%d/%d != int4 (src=%s)\n",
+        int xf=src->g.fmt;   /* int4 (2) and int3-g64 (5) tiers; gate/up must share fmt for
+                              * the fused gate_up shader, down may differ per-projection */
+        if((xf!=2&&xf!=5)||src->u.fmt!=xf||(src->d.fmt!=2&&src->d.fmt!=5)){
+            if(tried<4) fprintf(stderr,"[VK] tier fill: (%d,%d) fmt %d/%d/%d not int4/int3-g64 (src=%s)\n",
                 layer,eid,src->g.fmt,src->u.fmt,src->d.fmt,src==&tmp?"load":"pin");
-            continue; }   /* int4 tier only */
+            continue; }
         ColiVkTensor **slot=vk_reg_at(layer,eid);
-        if(!coli_vk_tensor_ensure(&slot[0],src->g.q4,src->g.s,2,c->hidden,c->moe_inter)||
-           !coli_vk_tensor_ensure(&slot[1],src->u.q4,src->u.s,2,c->hidden,c->moe_inter)||
-           !coli_vk_tensor_ensure(&slot[2],src->d.q4,src->d.s,2,c->moe_inter,c->hidden)){
+        if(!coli_vk_tensor_ensure(&slot[0],src->g.q4,src->g.s,xf,c->hidden,c->moe_inter)||
+           !coli_vk_tensor_ensure(&slot[1],src->u.q4,src->u.s,xf,c->hidden,c->moe_inter)||
+           !coli_vk_tensor_ensure(&slot[2],src->d.q4,src->d.s,src->d.fmt,c->moe_inter,c->hidden)){
             if(slot[0]){coli_vk_tensor_free(slot[0]);slot[0]=NULL;}
             if(slot[1]){coli_vk_tensor_free(slot[1]);slot[1]=NULL;}
             fprintf(stderr,"[VK] expert tier: VRAM full after %d experts\n",g_vk_reg_n);
