@@ -2076,6 +2076,16 @@ static void pipe_dispatch(Model *m,int layer,const int *eids,int njobs){
     atomic_store_explicit(&g_pp.cur,(g<<8),memory_order_release);                          /* PUBLISH */
     pthread_mutex_lock(&g_pp.mx); pthread_cond_broadcast(&g_pp.cv); pthread_mutex_unlock(&g_pp.mx);
 }
+/* Non-blocking probe of a pipe slot's load-done flag — an ORDERING hint only (the
+ * VK block computes ready experts first): callers still pipe_wait() before touching
+ * the slab. Under URING completion happens inside finalize, there is no flag to
+ * peek — report not-ready and let the wait do the work. */
+static inline int pipe_ready(int q){
+#ifdef __linux__
+    if(g_uring) return 0;
+#endif
+    return atomic_load_explicit(&g_pp.ready[q],memory_order_acquire)!=0;
+}
 static inline void pipe_wait(int q){
 #ifdef __linux__
     if(g_uring){
@@ -3603,20 +3613,40 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                 }
             }
             int vk_issued = nvk>0 && coli_vk_expert_group_issue(vg,vu,vd,vrows,nvk,vk_xh);
-            double t_cpu0=now_s();
-            for(int c2=0;c2<ncpu;c2++){ ESlot *e=ce[c2]; int nr=cnr[c2];
-                if(g_pipe && cqof[c2]>=0){ double tw=now_s(); pipe_wait(cqof[c2]); m->t_ewait += now_s()-tw; }
-                if(!e->slab) expert_load(m,layer,e->eid,e,1,1);   /* demand=1: moe miss path (FASE A snapshot valid) */
-                for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D, x+(int64_t)crmap[c2*S+r]*D, D*sizeof(float));
-                expert_gate_up(gg,uu,xg,&e->g,&e->u,nr);
-                for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
-                matmul_qt(hh, gg, &e->d, nr);
-                for(int r=0;r<nr;r++){ float *os=out+(int64_t)crmap[c2*S+r]*D, wgt=cwmap[c2*S+r], *hr=hh+(int64_t)r*D;
-                    for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
-                if(g_prof){ m->cpu_expert_bytes+=qt_bytes(&e->g)+qt_bytes(&e->u)+qt_bytes(&e->d);
-                    m->cpu_expert_rows+=(uint64_t)nr; }
+            /* CPU share stays SERIAL over experts with row-parallel kernels: a decode
+             * block leaves only ~5-6 CPU experts (the tier absorbs the hot head), fewer
+             * than the OMP pool, so one-task-per-expert ran each expert single-threaded
+             * at ~2.5 GB/s while cores idled — measured -23% vs this structure (A/B
+             * 2026-07-20); the kernels' internal parallel-for already uses every core.
+             * What IS reordered: pipe-ready and cache-resident experts run FIRST, so a
+             * still-loading expert gets its I/O hidden behind their matmuls instead of
+             * head-of-line blocking the block. The class is an ordering HINT only —
+             * the body still pipe_waits/loads every entry, so a stale probe costs
+             * nothing but order. t_ecpu counts kernel time only (the default path's
+             * meaning); the waits land in t_ewait. */
+            {
+                uint8_t vcls[64];
+                for(int c2=0;c2<ncpu;c2++){
+                    if(g_pipe && cqof[c2]>=0) vcls[c2] = pipe_ready(cqof[c2]) ? 0 : 2;   /* loaded : in flight */
+                    else                      vcls[c2] = ce[c2]->slab       ? 0 : 1;   /* resident : sync miss */
+                }
+                int vord[64], no=0;
+                for(uint8_t k2=0;k2<3;k2++) for(int c2=0;c2<ncpu;c2++) if(vcls[c2]==k2) vord[no++]=c2;
+                for(int oi=0;oi<no;oi++){ int c2=vord[oi]; ESlot *e=ce[c2]; int nr=cnr[c2];
+                    if(g_pipe && cqof[c2]>=0){ double tw=now_s(); pipe_wait(cqof[c2]); m->t_ewait += now_s()-tw; }
+                    if(!e->slab) expert_load(m,layer,e->eid,e,1,1);   /* demand=1: moe miss path (FASE A snapshot valid) */
+                    for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D, x+(int64_t)crmap[c2*S+r]*D, D*sizeof(float));
+                    double te0=now_s();
+                    expert_gate_up(gg,uu,xg,&e->g,&e->u,nr);
+                    for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
+                    matmul_qt(hh, gg, &e->d, nr);
+                    for(int r=0;r<nr;r++){ float *os=out+(int64_t)crmap[c2*S+r]*D, wgt=cwmap[c2*S+r], *hr=hh+(int64_t)r*D;
+                        for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
+                    if(g_prof){ m->t_ecpu+=now_s()-te0;
+                        m->cpu_expert_bytes+=qt_bytes(&e->g)+qt_bytes(&e->u)+qt_bytes(&e->d);
+                        m->cpu_expert_rows+=(uint64_t)nr; }
+                }
             }
-            if(g_prof) m->t_ecpu+=now_s()-t_cpu0;
             double t_take0=now_s();
             int vk_ok = vk_issued && coli_vk_expert_group_take(vk_yh);
             if(g_prof) m->t_egpu+=now_s()-t_take0;
