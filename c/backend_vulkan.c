@@ -395,6 +395,58 @@ void coli_vk_mem_info(size_t *used, size_t *count) {
     if (count) *count = G.tensor_count;
 }
 
+/* Weight-tensor suballocator: many tensors share a few big VkDeviceMemory blocks.
+ * WHY: per-submit driver cost measures LINEAR in the number of distinct device-memory
+ * objects the queue actively references (~0.35 ms/submit extra at a 950-expert tier's
+ * ~5.7k allocations: decode attention 7.9s @420 -> 17.6s @950, flat once the GPU paths
+ * moved to CPU; IDLE allocations cost nothing until first referenced — harness ballast
+ * probe). Packing tier+dense uploads into 256 MB arenas keeps the referenced-BO count
+ * in the dozens. Arena slices are never reclaimed per-tensor (registry/dense uploads
+ * live for the process; the rare fill-failure free leaks its slice, bounded) — a
+ * tensor's mem handle stays VK_NULL_HANDLE, which coli_vk_tensor_free's vkFreeMemory
+ * treats as the documented no-op. */
+typedef struct VkWArena { VkDeviceMemory mem; uint8_t *base; size_t cap, off; struct VkWArena *next; } VkWArena;
+static VkWArena *g_warena;
+#define VK_WARENA_BLOCK ((size_t)256 << 20)
+static int arena_suballoc(size_t bytes, VkBuffer *buf, void **ptr) {
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = bytes, .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+    VKCHECK(vkCreateBuffer(G.dev, &bi, NULL, buf), "vkCreateBuffer");
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(G.dev, *buf, &req);
+    if (!(req.memoryTypeBits & (1u << G.memtype))) { vkDestroyBuffer(G.dev, *buf, NULL); *buf = VK_NULL_HANDLE; return 0; }
+    size_t align = req.alignment ? req.alignment : 256, off = 0;
+    VkWArena *a = g_warena;
+    for (; a; a = a->next) {
+        off = (a->off + align - 1) & ~(align - 1);
+        if (off + req.size <= a->cap) break;
+    }
+    if (!a) {
+        size_t cap = req.size > VK_WARENA_BLOCK ? (req.size + 4095) & ~(size_t)4095 : VK_WARENA_BLOCK;
+        a = calloc(1, sizeof(*a));
+        if (!a) { vkDestroyBuffer(G.dev, *buf, NULL); *buf = VK_NULL_HANDLE; return 0; }
+        VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            .allocationSize = cap, .memoryTypeIndex = G.memtype};
+#ifdef VK_EXT_memory_priority
+        VkMemoryPriorityAllocateInfoEXT pri = {.sType = VK_STRUCTURE_TYPE_MEMORY_PRIORITY_ALLOCATE_INFO_EXT,
+            .priority = G.prio};
+        if (G.has_prio) ai.pNext = &pri;
+#endif
+        if (vkAllocateMemory(G.dev, &ai, NULL, &a->mem) != VK_SUCCESS ||
+            vkMapMemory(G.dev, a->mem, 0, cap, 0, (void **)&a->base) != VK_SUCCESS) {
+            if (a->mem) vkFreeMemory(G.dev, a->mem, NULL);
+            free(a); vkDestroyBuffer(G.dev, *buf, NULL); *buf = VK_NULL_HANDLE; return 0;
+        }
+        a->cap = cap; a->next = g_warena; g_warena = a;
+        off = 0;
+    }
+    VKCHECK(vkBindBufferMemory(G.dev, *buf, a->mem, off), "vkBindBufferMemory");
+    if (ptr) *ptr = a->base + off;
+    a->off = off + req.size;
+    return 1;
+}
+
 static int upload_tensor(ColiVkTensor **out, const void *weights, const float *scales,
                          int fmt, int I, int O) {
     if (*out) return (*out)->fmt == fmt && (*out)->I == I && (*out)->O == O;
@@ -408,14 +460,14 @@ static int upload_tensor(ColiVkTensor **out, const void *weights, const float *s
     size_t sfl = scale_floats(fmt, I, O);            // fmt=5: O*ceil(I/64) group scales
     t->wbytes = stride * (size_t)O;
     void *wptr;
-    if (!alloc_hostvis(t->wbytes, &t->wbuf, &t->wmem, &wptr)) { free(t); return 0; }
+    if (!arena_suballoc(t->wbytes, &t->wbuf, &wptr)) { free(t); return 0; }
     memset(wptr, 0, t->wbytes);
     for (int o = 0; o < O; o++)                        // copy row-by-row into padded layout
         memcpy((uint8_t *)wptr + (size_t)o * stride,
                (const uint8_t *)weights + (size_t)o * cpu_rb, cpu_rb);
     void *sptr;
-    if (!alloc_hostvis(sfl * sizeof(float), &t->sbuf, &t->smem, &sptr)) {
-        vkDestroyBuffer(G.dev, t->wbuf, NULL); vkFreeMemory(G.dev, t->wmem, NULL); free(t); return 0;
+    if (!arena_suballoc(sfl * sizeof(float), &t->sbuf, &sptr)) {
+        vkDestroyBuffer(G.dev, t->wbuf, NULL); free(t); return 0;
     }
     memcpy(sptr, scales, sfl * sizeof(float));
     // Counters are touched concurrently: frees run from expert_load under
@@ -952,6 +1004,12 @@ void coli_vk_shutdown(void) {
         vkDestroyDescriptorSetLayout(G.dev, G.dsl_att, NULL);
         vkDestroyShaderModule(G.dev, G.shader_att, NULL);
     }
+    for (VkWArena *a = g_warena; a;) {   /* weight arenas: unmapped/freed with the device */
+        VkWArena *nx = a->next;
+        vkUnmapMemory(G.dev, a->mem); vkFreeMemory(G.dev, a->mem, NULL);
+        free(a); a = nx;
+    }
+    g_warena = NULL;
     vkDestroyDevice(G.dev, NULL);
     vkDestroyInstance(G.inst, NULL);
     memset(&G, 0, sizeof(G));
@@ -1344,6 +1402,19 @@ int main(int argc, char **argv) {
     if (!coli_vk_init(spv)) { printf("vk init failed\n"); return 1; }
     srand(1234);
     int bad = 0;
+    /* COLI_VK_TEST_BALLAST=N: allocate N idle 4 MB device buffers before benching.
+     * Probes whether per-submit cost scales with the process's ALLOCATION COUNT
+     * (RADV/amdgpu CS buffer-list accounting) independent of bytes — the suspected
+     * mechanism behind decode attention degrading with expert-tier size even with
+     * VRAM to spare (7.9s @2.6k BOs -> 15.6s @4.3k with 2.9 GB free). */
+    {
+        int nb = getenv("COLI_VK_TEST_BALLAST") ? atoi(getenv("COLI_VK_TEST_BALLAST")) : 0;
+        for (int i = 0; i < nb; i++) {
+            VkBuffer b; VkDeviceMemory m;
+            if (!alloc_hostvis_mt(4u << 20, &b, &m, NULL, G.memtype)) { printf("ballast stop at %d\n", i); break; }
+        }
+        if (nb) printf("ballast: %d x 4 MB idle allocations\n", nb);
+    }
     bad |= run_case(1, 1, 6144, 1536, 50);   // int8 expert gate/up shape (S=1 decode)
     bad |= run_case(2, 1, 6144, 1536, 50);   // int4 expert
     bad |= run_case(1, 1, 1536, 6144, 50);   // down proj shape
