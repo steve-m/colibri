@@ -21,6 +21,16 @@ void coli_vk_shutdown(void);
 int  coli_vk_available(void);
 void coli_vk_mem_info(size_t *used_bytes, size_t *tensor_count);
 
+/* VRAM pressure-proofing (both no-ops when the extension is absent):
+ * alloc_priority sets the eviction-priority class of SUBSEQUENT weight uploads
+ * (VK_EXT_memory_priority; scratches and the KV mirror pin themselves at 1.0) —
+ * the engine brackets the bulk expert-tier fill at 0.4 so an oversubscribed heap
+ * evicts cold experts, never the per-token attention working set.
+ * mem_budget reports device-local usage/budget in GB (VK_EXT_memory_budget);
+ * returns 0 if unavailable. */
+void coli_vk_alloc_priority(float p);
+int  coli_vk_mem_budget(double *used_gb, double *budget_gb);
+
 /* y[S,O] = (x[S,I] @ dequant(W[O,I])^T) * scale[O].
  * fmt matches QT in glm.c: 1=int8, 2=int4. (0=f32,3=int2 fall back to CPU.)
  * First call uploads W+scales; later calls reuse the resident copy.

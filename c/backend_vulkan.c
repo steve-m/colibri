@@ -87,6 +87,13 @@ static struct {
     ColiVkTensor *bound_tensor; int bound_S, bound_I, bound_O, cmd_ready;
     VkBuffer bound_xbuf, bound_ybuf;
     size_t used_bytes, tensor_count;
+    /* VRAM pressure-proofing: with VK_EXT_memory_priority the attention working set
+     * (KV mirror, scratches) outranks bulk expert weights, so an oversubscribed heap
+     * evicts cold tier experts instead of thrashing the per-token attention submits
+     * (measured: decode attention 7.8s at 7.6 GB resident -> 17.8s at 15.2 GB).
+     * VK_EXT_memory_budget lets the tier fill stop at a reserve instead of guessing. */
+    int has_prio, has_budget;
+    float prio;                  /* priority applied to the NEXT allocations (class knob) */
 } G;
 
 struct PC { int fmt, S, I, O, rowWords; };
@@ -131,10 +138,42 @@ static int alloc_hostvis_mt(size_t bytes, VkBuffer *buf, VkDeviceMemory *mem, vo
     vkGetBufferMemoryRequirements(G.dev, *buf, &req);
     VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
         .allocationSize = req.size, .memoryTypeIndex = memtype};
+#ifdef VK_EXT_memory_priority
+    VkMemoryPriorityAllocateInfoEXT pri = {.sType = VK_STRUCTURE_TYPE_MEMORY_PRIORITY_ALLOCATE_INFO_EXT,
+        .priority = G.prio};
+    if (G.has_prio) ai.pNext = &pri;
+#endif
     VKCHECK(vkAllocateMemory(G.dev, &ai, NULL, mem), "vkAllocateMemory");
     VKCHECK(vkBindBufferMemory(G.dev, *buf, *mem, 0), "vkBindBufferMemory");
     if (ptr) VKCHECK(vkMapMemory(G.dev, *mem, 0, bytes, 0, ptr), "vkMapMemory");
     return 1;
+}
+/* Priority class of subsequent allocations (VK_EXT_memory_priority; no-op without it).
+ * Scratches/KV force 1.0 internally; weight uploads take whatever is current — the
+ * engine sets 0.4 around the bulk expert-tier fill, dense stays at the 0.75 default. */
+void coli_vk_alloc_priority(float p) { G.prio = p < 0 ? 0 : p > 1 ? 1 : p; }
+
+/* Device-local heap usage/budget in GB (VK_EXT_memory_budget). Returns 0 when the
+ * extension is absent — callers then keep their count-based caps unchanged. */
+int coli_vk_mem_budget(double *used_gb, double *budget_gb) {
+#ifdef VK_EXT_memory_budget
+    if (!G.has_budget || !G.phys) return 0;
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT bud = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+    VkPhysicalDeviceMemoryProperties2 mp2 = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, .pNext = &bud};
+    vkGetPhysicalDeviceMemoryProperties2(G.phys, &mp2);
+    double u = 0, b = 0;
+    for (uint32_t i = 0; i < mp2.memoryProperties.memoryHeapCount; i++)
+        if (mp2.memoryProperties.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
+            u += (double)bud.heapUsage[i]; b += (double)bud.heapBudget[i];
+        }
+    if (used_gb) *used_gb = u / 1e9;
+    if (budget_gb) *budget_gb = b / 1e9;
+    return b > 0;
+#else
+    (void)used_gb; (void)budget_gb; return 0;
+#endif
 }
 static int alloc_hostvis(size_t bytes, VkBuffer *buf, VkDeviceMemory *mem, void **ptr) {
     return alloc_hostvis_mt(bytes, buf, mem, ptr, G.memtype);
@@ -144,7 +183,10 @@ static int scratch_reserve_mt(Scratch *s, size_t bytes, uint32_t memtype) {
     if (s->cap >= bytes) return 1;
     if (s->buf) { vkDestroyBuffer(G.dev, s->buf, NULL); vkFreeMemory(G.dev, s->mem, NULL); }
     s->buf = VK_NULL_HANDLE; s->cap = 0; s->ptr = NULL;
-    if (!alloc_hostvis_mt(bytes, &s->buf, &s->mem, &s->ptr, memtype)) return 0;
+    float p0 = G.prio; G.prio = 1.0f;            /* scratches ride every submit: never evict */
+    int ok = alloc_hostvis_mt(bytes, &s->buf, &s->mem, &s->ptr, memtype);
+    G.prio = p0;
+    if (!ok) return 0;
     s->cap = bytes;
     return 1;
 }
@@ -266,10 +308,45 @@ int coli_vk_init(const char *spv_path) {
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
         .queueFamilyIndex = G.qfam, .queueCount = 1, .pQueuePriorities = &prio};
+    /* Pressure-proofing extensions (both optional, detected at runtime):
+     * memory_priority ranks allocations for the kernel's eviction order,
+     * memory_budget exposes how much VRAM a new allocation can still take. */
+    const char *dext[2]; uint32_t ndext = 0;
+    {
+        uint32_t ne = 0;
+        vkEnumerateDeviceExtensionProperties(G.phys, NULL, &ne, NULL);
+        VkExtensionProperties *ep = ne ? malloc(ne * sizeof(*ep)) : NULL;
+        if (ep) {
+            vkEnumerateDeviceExtensionProperties(G.phys, NULL, &ne, ep);
+            for (uint32_t i = 0; i < ne; i++) {
+#ifdef VK_EXT_memory_priority
+                if (!strcmp(ep[i].extensionName, VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME)) G.has_prio = 1;
+#endif
+#ifdef VK_EXT_memory_budget
+                if (!strcmp(ep[i].extensionName, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) G.has_budget = 1;
+#endif
+            }
+            free(ep);
+        }
+    }
     VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
         .queueCreateInfoCount = 1, .pQueueCreateInfos = &qi};
+#ifdef VK_EXT_memory_priority
+    VkPhysicalDeviceMemoryPriorityFeaturesEXT prif = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PRIORITY_FEATURES_EXT,
+        .memoryPriority = VK_TRUE};
+    if (G.has_prio) { dext[ndext++] = VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME; prif.pNext = (void *)di.pNext; di.pNext = &prif; }
+#endif
+#ifdef VK_EXT_memory_budget
+    if (G.has_budget) dext[ndext++] = VK_EXT_MEMORY_BUDGET_EXTENSION_NAME;
+#endif
+    di.enabledExtensionCount = ndext; di.ppEnabledExtensionNames = ndext ? dext : NULL;
+    G.prio = 0.75f;                              /* default class: dense/resident weights */
     VKCHECK(vkCreateDevice(G.phys, &di, NULL, &G.dev), "vkCreateDevice");
     vkGetDeviceQueue(G.dev, G.qfam, 0, &G.queue);
+    if (G.has_prio || G.has_budget)
+        fprintf(stderr, "[VK] VRAM pressure-proofing: memory_priority %s, memory_budget %s\n",
+                G.has_prio ? "on" : "absent", G.has_budget ? "on" : "absent");
 
     int mt = pick_memtype();
     if (mt < 0) { fprintf(stderr, "[VK] no host-visible memory\n"); return 0; }
@@ -605,9 +682,12 @@ int coli_vk_kv_ensure(int layer, int max_rows, int K, int Rd) {
     if (!G.ready || layer < 0 || layer >= VK_KV_LAYERS || max_rows < 1 || K < 1 || Rd < 1) return 0;
     VkKvLayer *v = &G.kv[layer];
     if (v->bl) return v->rows >= max_rows && v->K == K && v->R == Rd;  /* resize goes through coli_vk_kv_reset */
-    if (!alloc_hostvis((size_t)max_rows * K * 4, &v->bl, &v->ml, &v->pl)) return 0;
-    if (!alloc_hostvis((size_t)max_rows * Rd * 4, &v->br, &v->mr, &v->pr)) {
-        vkDestroyBuffer(G.dev, v->bl, NULL); vkFreeMemory(G.dev, v->ml, NULL);
+    float p0 = G.prio; G.prio = 1.0f;            /* KV mirror rides every attention submit */
+    int ok1 = alloc_hostvis((size_t)max_rows * K * 4, &v->bl, &v->ml, &v->pl);
+    int ok = ok1 && alloc_hostvis((size_t)max_rows * Rd * 4, &v->br, &v->mr, &v->pr);
+    G.prio = p0;
+    if (!ok) {
+        if (ok1) { vkDestroyBuffer(G.dev, v->bl, NULL); vkFreeMemory(G.dev, v->ml, NULL); }
         memset(v, 0, sizeof(*v)); return 0;
     }
     v->rows = max_rows; v->K = K; v->R = Rd;

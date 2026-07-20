@@ -6335,7 +6335,18 @@ static void vk_registry_fill(Model *m){
     if(!g_vk_reg){ free(cand); return; }
     ESlot tmp; memset(&tmp,0,sizeof(tmp)); tmp.eid=-1;
     double t0=now_s(); int64_t bytes=0; int tried=0, loadfail=0;
+    /* Pressure-proofing: tier weights are the EVICTABLE class (0.4 vs scratch/KV 1.0,
+     * dense 0.75) so an oversubscribed heap sheds cold experts instead of thrashing
+     * the per-token attention submits; and the fill STOPS while the device-local
+     * budget still holds COLI_VK_RESERVE_GB (default 3) for the lazily-allocated
+     * dense weights + KV mirror + staging (measured ~1.7 GB at 4k ctx, growing with
+     * max_t). Without the budget extension the count cap alone applies, as before. */
+    double vkr_reserve = getenv("COLI_VK_RESERVE_GB")?atof(getenv("COLI_VK_RESERVE_GB")):3.0;
+    int vkr_stopped=0; double vkr_used=0, vkr_budget=0;
+    coli_vk_alloc_priority(0.4f);
     for(int64_t i2=0;i2<n && g_vk_reg_n<g_vk_budget;i2++){
+        if(vkr_reserve>0 && (g_vk_reg_n&7)==0 && coli_vk_mem_budget(&vkr_used,&vkr_budget)
+           && vkr_budget-vkr_used < vkr_reserve){ vkr_stopped=1; break; }
         int layer=cand[i2].layer, eid=cand[i2].eid; tried++;
         ESlot *src=NULL, *P=m->pin[layer];
         for(int z=0;z<m->npin[layer];z++) if(P[z].eid==eid && P[z].slab){ src=&P[z]; break; }
@@ -6361,10 +6372,14 @@ static void vk_registry_fill(Model *m){
         bytes+=coli_vk_tensor_bytes(slot[0])+coli_vk_tensor_bytes(slot[1])+coli_vk_tensor_bytes(slot[2]);
         g_vk_reg_n++;
     }
+    coli_vk_alloc_priority(0.75f);               /* back to the dense/default class */
     if(tmp.slab){ compat_aligned_free(tmp.slab); free(tmp.fslab); }
     free(cand);
     fprintf(stderr,"[VK] expert tier: %d hot experts resident (%.2f GB VRAM, %.1fs, top-%d of history)\n",
             g_vk_reg_n,bytes/1e9,now_s()-t0,tried);
+    if(vkr_stopped)
+        fprintf(stderr,"[VK] expert tier: budget stop at %d experts — %.1f of %.1f GB device-local used, %.1f GB reserved (COLI_VK_RESERVE_GB)\n",
+                g_vk_reg_n,vkr_used,vkr_budget,vkr_reserve);
 }
 #endif
 
