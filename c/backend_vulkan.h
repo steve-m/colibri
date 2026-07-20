@@ -84,6 +84,16 @@ int  coli_vk_attention_absorb(ColiVkTensor **kvb, const void *w, const float *sc
                               int Q, int R, int V, int K, int st0, int T, float scale);
 /* Two resident matmuls sharing one input x in ONE submit (q_a + kv_a prologue pair).
  * Returns 0 -> caller falls back to single-matmul calls. */
+/* q-prep chain: [q_a+kv_a pair] -> rmsnorm(q latent) -> q_b in ONE submit (needs
+ * rmsnorm.spv next to the main shader; returns 0 without it -> 3-submit path).
+ * lnw = the q-latent RMS-norm weights [Oqa], resident per layer after first call. */
+int  coli_vk_attn_qprep(int layer,
+                        ColiVkTensor **qa,  const void *wqa,  const float *sqa,  int Oqa,
+                        ColiVkTensor **kva, const void *wkva, const float *skva, int Okva,
+                        ColiVkTensor **qb,  const void *wqb,  const float *sqb,  int Oqb,
+                        int fmt, int grp, const float *lnw, float eps,
+                        const float *x, int S, int I, float *q_out, float *kv_out,
+                        float *lat_out /* normed q latent [S,Oqa], NULLable — DSA indexer input */);
 int  coli_vk_matmul_pair(ColiVkTensor **t1p, float *y1, const void *w1, const float *s1, int O1,
                          ColiVkTensor **t2p, float *y2, const void *w2, const float *s2, int O2,
                          int fmt, const float *x, int S, int I, int grp);

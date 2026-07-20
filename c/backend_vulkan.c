@@ -74,6 +74,13 @@ static struct {
      * immediately, the CPU computes its share, take() joins. */
     VkCommandBuffer eg_cmd; VkFence eg_fence; int eg_inflight; size_t eg_pending_yb;
     double eg_t0, eg_t1, eg_t2, eg_t3; int eg_prof;
+    /* q-prep chain (pair -> rmsnorm -> q_b in ONE submit): norm pipeline (3 bindings),
+     * a 3rd matmul set + norm set, GPU-only latent intermediates, per-layer resident
+     * norm-weight buffers (tiny, uploaded once like the KV mirror). */
+    VkShaderModule shader_nrm; VkDescriptorSetLayout dsl_nrm; VkPipelineLayout plyt_nrm;
+    VkPipeline pipe_nrm; VkDescriptorPool qprep_pool; VkDescriptorSet dset_qp3, dset_nrm;
+    Scratch qp1, qp2;
+    VkBuffer lnbuf[VK_KV_LAYERS]; VkDeviceMemory lnmem[VK_KV_LAYERS]; int lnlen[VK_KV_LAYERS];
     Scratch att_sc;              /* attention score scratch (GPU-only) */
     Scratch att_ctx;             /* fused absorb+o: ctx stays on device (GPU-only) */
     Scratch y2;                  /* second output of the fused matmul pair (readback) */
@@ -97,6 +104,7 @@ static struct {
 } G;
 
 struct PC { int fmt, S, I, O, rowWords, gs; };
+struct PCN { int S, D; float eps; };
 /* Push constants of the absorb attention kernel (must match attention_absorb.comp). */
 struct PCAttn { int fmt, S, H, Q, R, V, K, st0, T, rowWords, cap; float scale; int gs; };
 
@@ -367,6 +375,24 @@ int coli_vk_init(const char *spv_path) {
         return 0;
 
     /* Optional MLA absorb attention pipeline (same directory as the main shader). */
+    /* Optional rmsnorm pipeline: enables the pair->norm->q_b single-submit chain
+     * (coli_vk_attn_qprep); absent -> callers keep the 3-submit path. */
+    char nrm_path[512]; derive_dir_file(spv_path, "rmsnorm.spv", nrm_path, sizeof(nrm_path));
+    G.shader_nrm = load_spv(nrm_path);
+    if (G.shader_nrm) {
+        VkDescriptorPool np; VkDescriptorSet ns;
+        if (!build_pipeline(3, sizeof(struct PCN), G.shader_nrm, &G.dsl_nrm, &G.plyt_nrm, &G.pipe_nrm, &np, &ns))
+            return 0;
+        G.dset_nrm = ns;
+        /* one extra 4-binding matmul set for the chain's 3rd matmul (dset+dset_pair serve 1+2) */
+        VkDescriptorPoolSize ps3 = {.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 4};
+        VkDescriptorPoolCreateInfo dpi3 = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+            .maxSets = 1, .poolSizeCount = 1, .pPoolSizes = &ps3};
+        VKCHECK(vkCreateDescriptorPool(G.dev, &dpi3, NULL, &G.qprep_pool), "qprep descPool");
+        VkDescriptorSetAllocateInfo dsa3 = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .descriptorPool = G.qprep_pool, .descriptorSetCount = 1, .pSetLayouts = &G.dsl};
+        VKCHECK(vkAllocateDescriptorSets(G.dev, &dsa3, &G.dset_qp3), "qprep descSet");
+    }
     char att_path[512]; derive_dir_file(spv_path, "attention_absorb.spv", att_path, sizeof(att_path));
     G.shader_att = load_spv(att_path);
     if (G.shader_att && !build_pipeline(7, sizeof(struct PCAttn), G.shader_att, &G.dsl_att, &G.plyt_att, &G.pipe_att, &G.dpool_att, &G.dset_att))
@@ -918,6 +944,108 @@ int coli_vk_matmul_pair(ColiVkTensor **t1p, float *y1, const void *w1, const flo
     return 1;
 }
 
+
+/* q-prep chain: [q_a + kv_a pair] -> rmsnorm(q_latent) -> [q_b], recorded in ONE
+ * command buffer with compute barriers — one submit+fence where the engine paid
+ * three (the middle CPU norm forced two roundtrips). Only q [S,Oqb] and the kv
+ * latent [S,Okva] return to the host (RoPE + canonical KV append stay CPU-side).
+ * The per-layer norm weights upload once into a tiny resident buffer (KV-mirror
+ * pattern). All three tensors must share fmt (dense io is int8 in practice).
+ * Returns 0 -> caller runs the 3-submit path (also when rmsnorm.spv is absent). */
+int coli_vk_attn_qprep(int layer,
+                       ColiVkTensor **qa,  const void *wqa,  const float *sqa,  int Oqa,
+                       ColiVkTensor **kva, const void *wkva, const float *skva, int Okva,
+                       ColiVkTensor **qb,  const void *wqb,  const float *sqb,  int Oqb,
+                       int fmt, int grp, const float *lnw, float eps,
+                       const float *x, int S, int I, float *q_out, float *kv_out, float *lat_out) {
+    if (!G.ready || !G.shader_nrm || S < 1 || layer < 0 || layer >= VK_KV_LAYERS) return 0;
+    if (!upload_tensor(qa, wqa, sqa, fmt, I, Oqa, grp) || !upload_tensor(kva, wkva, skva, fmt, I, Okva, grp) ||
+        !upload_tensor(qb, wqb, sqb, fmt, Oqa, Oqb, grp)) return 0;
+    ColiVkTensor *tqa = *qa, *tkv = *kva, *tqb = *qb;
+    if (!G.lnbuf[layer]) {                       /* resident norm weights, uploaded once */
+        void *lp; float p0 = G.prio; G.prio = 1.0f;
+        int ok = alloc_hostvis((size_t)Oqa * 4, &G.lnbuf[layer], &G.lnmem[layer], &lp);
+        G.prio = p0;
+        if (!ok) { G.lnbuf[layer] = VK_NULL_HANDLE; return 0; }
+        memcpy(lp, lnw, (size_t)Oqa * 4); G.lnlen[layer] = Oqa;
+    }
+    if (G.lnlen[layer] != Oqa) return 0;
+    size_t xb = (size_t)S * I * 4, qb_b = (size_t)S * Oqb * 4, kvb_b = (size_t)S * Okva * 4;
+    size_t lat = (size_t)S * Oqa * 4;
+    if (!scratch_reserve(&G.x, xb) || !scratch_reserve_mt(&G.y, qb_b, G.memtype_cached) ||
+        !scratch_reserve_mt(&G.y2, kvb_b, G.memtype_cached) ||
+        !scratch_reserve(&G.qp1, lat) ||
+        !scratch_reserve_mt(&G.qp2, lat, G.memtype_cached)) return 0;   /* normed latent reads back (DSA indexer) */
+    memcpy(G.x.ptr, x, xb);
+
+    VkDescriptorBufferInfo b1[4] = {
+        {.buffer = G.x.buf, .range = VK_WHOLE_SIZE}, {.buffer = tqa->wbuf, .range = VK_WHOLE_SIZE},
+        {.buffer = tqa->sbuf, .range = VK_WHOLE_SIZE}, {.buffer = G.qp1.buf, .range = VK_WHOLE_SIZE}};
+    VkDescriptorBufferInfo b2[4] = {
+        {.buffer = G.x.buf, .range = VK_WHOLE_SIZE}, {.buffer = tkv->wbuf, .range = VK_WHOLE_SIZE},
+        {.buffer = tkv->sbuf, .range = VK_WHOLE_SIZE}, {.buffer = G.y2.buf, .range = VK_WHOLE_SIZE}};
+    VkDescriptorBufferInfo bn[3] = {
+        {.buffer = G.qp1.buf, .range = VK_WHOLE_SIZE}, {.buffer = G.lnbuf[layer], .range = VK_WHOLE_SIZE},
+        {.buffer = G.qp2.buf, .range = VK_WHOLE_SIZE}};
+    VkDescriptorBufferInfo b3[4] = {
+        {.buffer = G.qp2.buf, .range = VK_WHOLE_SIZE}, {.buffer = tqb->wbuf, .range = VK_WHOLE_SIZE},
+        {.buffer = tqb->sbuf, .range = VK_WHOLE_SIZE}, {.buffer = G.y.buf, .range = VK_WHOLE_SIZE}};
+    if (!G.pair_pool) {   /* the chain reuses the pair's 2nd matmul set */
+        VkDescriptorPoolSize ps = {.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 4};
+        VkDescriptorPoolCreateInfo dpi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+            .maxSets = 1, .poolSizeCount = 1, .pPoolSizes = &ps};
+        VKCHECK(vkCreateDescriptorPool(G.dev, &dpi, NULL, &G.pair_pool), "pair descPool");
+        VkDescriptorSetAllocateInfo dsa = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .descriptorPool = G.pair_pool, .descriptorSetCount = 1, .pSetLayouts = &G.dsl};
+        VKCHECK(vkAllocateDescriptorSets(G.dev, &dsa, &G.dset_pair), "pair descSet");
+    }
+    wr_desc(G.dset, 4, b1); wr_desc(G.dset_pair, 4, b2); wr_desc(G.dset_qp3, 4, b3);
+    wr_desc(G.dset_nrm, 3, bn);
+
+    VKCHECK(vkResetCommandBuffer(G.cmd, 0), "resetCmd");
+    VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    VKCHECK(vkBeginCommandBuffer(G.cmd, &begin), "beginCmd");
+    VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT};
+    vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe);
+    struct PC pc1 = {fmt, S, I, Oqa, tqa->rowWords, tqa->gs};
+    vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt, 0, 1, &G.dset, 0, NULL);
+    vkCmdPushConstants(G.cmd, G.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc1), &pc1);
+    vkCmdDispatch(G.cmd, (uint32_t)((Oqa + 7) / 8), (uint32_t)S, 1);
+    struct PC pc2 = {fmt, S, I, Okva, tkv->rowWords, tkv->gs};
+    vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt, 0, 1, &G.dset_pair, 0, NULL);
+    vkCmdPushConstants(G.cmd, G.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc2), &pc2);
+    vkCmdDispatch(G.cmd, (uint32_t)((Okva + 7) / 8), (uint32_t)S, 1);
+    vkCmdPipelineBarrier(G.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         0, 1, &mb, 0, NULL, 0, NULL);
+    vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_nrm);
+    struct PCN pcn = {S, Oqa, eps};
+    vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_nrm, 0, 1, &G.dset_nrm, 0, NULL);
+    vkCmdPushConstants(G.cmd, G.plyt_nrm, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pcn), &pcn);
+    vkCmdDispatch(G.cmd, (uint32_t)S, 1, 1);
+    vkCmdPipelineBarrier(G.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         0, 1, &mb, 0, NULL, 0, NULL);
+    vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe);
+    struct PC pc3 = {fmt, S, Oqa, Oqb, tqb->rowWords, tqb->gs};
+    vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt, 0, 1, &G.dset_qp3, 0, NULL);
+    vkCmdPushConstants(G.cmd, G.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc3), &pc3);
+    vkCmdDispatch(G.cmd, (uint32_t)((Oqb + 7) / 8), (uint32_t)S, 1);
+    VKCHECK(vkEndCommandBuffer(G.cmd), "endCmd");
+
+    VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd};
+    VKCHECK(vkResetFences(G.dev, 1, &G.fence), "resetFence");
+    double vp0 = G.eg_prof ? vk_now() : 0;
+    VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.fence), "queueSubmit");
+    if (G.eg_prof) { double vp1 = vk_now(); g_vsub_ms += vp1 - vp0; vp0 = vp1; }
+    if (vkWaitForFences(G.dev, 1, &G.fence, VK_TRUE, 10000000000ULL) != VK_SUCCESS) { G.ready = 0; return 0; }
+    if (G.eg_prof) { g_vwait_ms += vk_now() - vp0; vkprof_tick(); }
+    memcpy(q_out, G.y.ptr, qb_b);
+    memcpy(kv_out, G.y2.ptr, kvb_b);
+    if (lat_out) memcpy(lat_out, G.qp2.ptr, lat);
+    G.cmd_ready = 0; G.bound_tensor = NULL;   /* the shared command buffer/binding was clobbered */
+    return 1;
+}
+
 /* Fused absorb attention + o-projection in ONE submit: the absorb kernel writes ctx
  * [S,H*V] to a device-only scratch, a barrier, then the resident o_proj ([Dout, H*V])
  * runs on it via the plain matmul pipeline — only out [S,Dout] returns to the host.
@@ -1445,6 +1573,55 @@ static int run_absorb(int fmt, int S, int H, int Q, int R, int V, int K, int st0
     return (maxrel > 2e-3 || pmaxrel > 5e-3) ? 1 : 0;
 }
 
+
+/* q-prep chain vs CPU ref: matmul(qa) -> rmsnorm -> matmul(qb), kv_a alongside. */
+static int run_qprep(int fmt, int S, int I, int Oqa, int Okva, int Oqb) {
+    size_t rba = ref_rowbytes(fmt, I), rbb = ref_rowbytes(fmt, Oqa);
+    size_t nsa = ref_scales(fmt, I, Oqa), nsk = ref_scales(fmt, I, Okva), nsb = ref_scales(fmt, Oqa, Oqb);
+    uint8_t *wa = malloc(rba * Oqa), *wk = malloc(rba * Okva), *wb = malloc(rbb * Oqb);
+    float *sa = malloc(nsa * 4), *sk = malloc(nsk * 4), *sb = malloc(nsb * 4);
+    float *ln = malloc((size_t)Oqa * 4), *x = malloc((size_t)S * I * 4);
+    float *qg = malloc((size_t)S * Oqb * 4), *kvg = malloc((size_t)S * Okva * 4);
+    float *lat = malloc((size_t)S * Oqa * 4), *qc = malloc((size_t)S * Oqb * 4), *kvc = malloc((size_t)S * Okva * 4);
+    for (size_t i = 0; i < rba * (size_t)Oqa; i++) wa[i] = rand() & 0xff;
+    for (size_t i = 0; i < rba * (size_t)Okva; i++) wk[i] = rand() & 0xff;
+    for (size_t i = 0; i < rbb * (size_t)Oqb; i++) wb[i] = rand() & 0xff;
+    for (size_t o = 0; o < nsa; o++) sa[o] = 0.01f + (rand() % 100) / 10000.0f;
+    for (size_t o = 0; o < nsk; o++) sk[o] = 0.01f + (rand() % 100) / 10000.0f;
+    for (size_t o = 0; o < nsb; o++) sb[o] = 0.01f + (rand() % 100) / 10000.0f;
+    for (int i = 0; i < Oqa; i++) ln[i] = 0.5f + (rand() % 100) / 100.0f;
+    for (int i = 0; i < S * I; i++) x[i] = (rand() % 2000 - 1000) / 500.0f;
+    ColiVkTensor *ta = NULL, *tk = NULL, *tb = NULL;
+    static int qp_layer = 140;         /* distinct high slot per case: the per-layer ln
+                                        * cache is upload-once by design (engine weights
+                                        * are immutable); reuse here would mix cases */
+    int layer = qp_layer++;
+    if (!coli_vk_attn_qprep(layer, &ta, wa, sa, Oqa, &tk, wk, sk, Okva, &tb, wb, sb, Oqb,
+                            fmt, g_ref_gs, ln, 1e-6f, x, S, I, qg, kvg, NULL)) {
+        printf("qprep unavailable (rmsnorm.spv missing?)\n"); return 1; }
+    cpu_ref(lat, x, wa, sa, fmt, S, I, Oqa);
+    cpu_ref(kvc, x, wk, sk, fmt, S, I, Okva);
+    for (int s = 0; s < S; s++) {                       /* rmsnorm rows like colibri.c */
+        double ms = 0; float *r = lat + (size_t)s * Oqa;
+        for (int i = 0; i < Oqa; i++) ms += (double)r[i] * r[i];
+        float rr = 1.0f / sqrtf((float)(ms / Oqa) + 1e-6f);
+        for (int i = 0; i < Oqa; i++) r[i] = r[i] * rr * ln[i];
+    }
+    cpu_ref(qc, lat, wb, sb, fmt, S, Oqa, Oqb);
+    float mq = 0, mk = 0;
+    for (int i = 0; i < S * Oqb; i++) { float d = fabsf(qg[i] - qc[i]) / (fabsf(qc[i]) + 1e-3f); if (d > mq) mq = d; }
+    for (int i = 0; i < S * Okva; i++) { float d = fabsf(kvg[i] - kvc[i]) / (fabsf(kvc[i]) + 1e-3f); if (d > mk) mk = d; }
+    printf("qprep fmt=%d S=%d I=%d (%d->%d, kv %d) | maxrel q %.4g kv %.4g\n", fmt, S, I, Oqa, Oqb, Okva, mq, mk);
+    coli_vk_tensor_free(ta); coli_vk_tensor_free(tk); coli_vk_tensor_free(tb);
+    free(wa); free(wk); free(wb); free(sa); free(sk); free(sb); free(ln); free(x);
+    free(qg); free(kvg); free(lat); free(qc); free(kvc);
+    /* q crosses TWO quantized reductions + the norm; random +-8-nibble rows are
+     * cancellation-heavy, so fp32-vs-f64 divergence amplifies ~10x vs one GEMV
+     * (same reasoning as the expert_group 3e-3 threshold). Engine-level logit
+     * comparison on real weights is the tight check. */
+    return mq > 1e-2f || mk > 1e-3f;
+}
+
 int main(int argc, char **argv) {
     const char *spv = argc > 1 ? argv[1] : "shaders/qmatmul.spv";
     if (!coli_vk_init(spv)) { printf("vk init failed\n"); return 1; }
@@ -1526,6 +1703,10 @@ int main(int argc, char **argv) {
     bad |= run_expert_group(2, 6144, 2048, 32);
     /* int3-g64 expert group: correctness + the 0.86x-bytes throughput question.
      * count=1 included — it is the SHARED-expert path shape in the engine. */
+    bad |= run_qprep(1, 1, 6144, 1536, 576, 16384);   /* GLM q_a/kv_a/q_b decode shapes */
+    bad |= run_qprep(1, 11, 6144, 1536, 576, 16384);  /* prefill batch */
+    bad |= run_qprep(1, 2, 6144, 1536, 576, 16384);   /* S=2 (MTP verify) */
+    bad |= run_qprep(2, 1, 6144, 1536, 576, 16384);   /* int4 dense variant */
     /* fmt=4 grouped int4 (#298 semantics), gs=64 across real shapes + gs=32 sanity */
     g_ref_gs = 64;
     bad |= run_case(4, 1, 6144, 2048, 50);

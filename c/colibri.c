@@ -2498,6 +2498,28 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
         pipe_done=attn_pipe_prefill(m,l,layer,x,0,S,pos_base,out,NULL);
 #endif
     if(!pipe_done){
+        int vk_qp=0; (void)vk_qp;
+#ifdef COLI_VULKAN
+        /* Single-submit q-prep chain: [q_a+kv_a] -> rmsnorm(q latent, on-GPU) -> q_b.
+         * One fence where the split path pays three (the CPU norm forced the extra
+         * roundtrips). Q and comp are written directly; QR is skipped entirely. */
+        static int g_vk_qprep=-1;
+        if(g_vk_qprep<0) g_vk_qprep=getenv("COLI_VK_QPREP")?atoi(getenv("COLI_VK_QPREP")):1;
+        float *dbgQ=NULL,*dbgC=NULL;
+        if(g_vk_qprep==2){ dbgQ=falloc((int64_t)S*l->q_b.O); dbgC=falloc((int64_t)S*l->kv_a.O); }
+        if(g_vk_qprep && g_vk_dense && l->q_a.fmt==l->kv_a.fmt && l->q_a.fmt==l->q_b.fmt && VK_FMT_OK(&l->q_a)
+           && l->q_a.gs==l->kv_a.gs && l->q_a.gs==l->q_b.gs)
+            vk_qp=coli_vk_attn_qprep(layer,
+                &l->q_a.vk, l->q_a.fmt==1?(const void*)l->q_a.q8:(const void*)l->q_a.q4, l->q_a.s, l->q_a.O,
+                &l->kv_a.vk, l->kv_a.fmt==1?(const void*)l->kv_a.q8:(const void*)l->kv_a.q4, l->kv_a.s, l->kv_a.O,
+                &l->q_b.vk, l->q_b.fmt==1?(const void*)l->q_b.q8:(const void*)l->q_b.q4, l->q_b.s, l->q_b.O,
+                l->q_a.fmt, l->q_a.gs, l->q_a_ln, c->eps, x, S, l->q_a.I,
+                g_vk_qprep==2?dbgQ:Q, g_vk_qprep==2?dbgC:comp,
+                g_vk_qprep==2?NULL:QR);   /* the DSA indexer reads the NORMED latent from QR */
+        int qp_ran=vk_qp;
+        if(g_vk_qprep==2 && vk_qp) vk_qp=0;   /* verify mode: chain ran, split path is authoritative */
+        if(!vk_qp){
+#endif
         int vk_pair=0; (void)vk_pair;
 #ifdef COLI_VULKAN
         /* q_a and kv_a read the SAME x: one fused submit for the pair (one x upload,
@@ -2518,6 +2540,14 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
         if(!vk_matmul_qt(&l->kv_a, comp, x, S))
 #endif
         matmul_qt_ex(comp, x, &l->kv_a, S, 0);
+#ifdef COLI_VULKAN
+        }
+        if(dbgQ){ float mq=0,mc=0;
+            for(int64_t i2=0;i2<(int64_t)S*l->q_b.O;i2++){ float d=fabsf(dbgQ[i2]-Q[i2])/(fabsf(Q[i2])+1e-3f); if(d>mq) mq=d; }
+            for(int64_t i2=0;i2<(int64_t)S*l->kv_a.O;i2++){ float d=fabsf(dbgC[i2]-comp[i2])/(fabsf(comp[i2])+1e-3f); if(d>mc) mc=d; }
+            fprintf(stderr,"[QPREP-VERIFY] layer %d S=%d ran=%d maxrel q %.4g kv %.4g\n",layer,S,qp_ran,mq,mc);
+            free(dbgQ); free(dbgC); }
+#endif
     }
     if(!pipe_done) for(int s=0;s<S;s++){
         KVState *ks=kvs?kvs[s]:m->kv;
