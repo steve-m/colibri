@@ -38,7 +38,7 @@ int  coli_vk_mem_budget(double *used_gb, double *budget_gb);
 int  coli_vk_matmul(ColiVkTensor **tensor,
                     float *y, const float *x,
                     const void *weights, const float *scales,
-                    int fmt, int S, int I, int O);
+                    int fmt, int S, int I, int O, int gs);
 
 /* Fused first half of the expert MLP in ONE dispatch (VK equivalent of
  * grouped_hidden_w4_dual): hidden[s,o] = silu(gate(x)) * up(x), reading x once for both
@@ -48,7 +48,7 @@ int  coli_vk_gate_up(ColiVkTensor **gate, ColiVkTensor **up,
                      float *hidden, const float *x,
                      const void *gw, const float *gs,
                      const void *uw, const float *us,
-                     int fmt, int S, int D, int I);
+                     int fmt, int S, int D, int I, int grp);
 
 /* Full batched expert MLP for `count` experts in ONE submit, hidden staying on-device:
  * for each c, y_c = down_c(silu(gate_c(x_c)) * up_c(x_c)). x/y packed [sum(rows)*D];
@@ -67,7 +67,7 @@ int  coli_vk_expert_group_take(float *y);
 
 /* Upload a resident tensor without computing (expert tier: gate/up/down uploaded once,
  * then driven by coli_vk_expert_group). Returns 0 on failure/unsupported fmt. */
-int  coli_vk_tensor_ensure(ColiVkTensor **tensor, const void *weights, const float *scales, int fmt, int I, int O);
+int  coli_vk_tensor_ensure(ColiVkTensor **tensor, const void *weights, const float *scales, int fmt, int I, int O, int grp);
 
 /* MLA absorb attention core (decode). The KV latent/rope caches live in persistent
  * per-layer device buffers: _ensure allocates a layer's cache at max_rows (once; resize
@@ -79,19 +79,19 @@ int  coli_vk_tensor_ensure(ColiVkTensor **tensor, const void *weights, const flo
 int  coli_vk_kv_ensure(int layer, int max_rows, int K, int Rd);
 int  coli_vk_kv_row(int layer, int pos, const float *L, const float *R);
 void coli_vk_kv_reset(void);
-int  coli_vk_attention_absorb(ColiVkTensor **kvb, const void *w, const float *sc, int fmt,
+int  coli_vk_attention_absorb(ColiVkTensor **kvb, const void *w, const float *sc, int fmt, int grp,
                               float *ctx, const float *q, int layer, int S, int H,
                               int Q, int R, int V, int K, int st0, int T, float scale);
 /* Two resident matmuls sharing one input x in ONE submit (q_a + kv_a prologue pair).
  * Returns 0 -> caller falls back to single-matmul calls. */
 int  coli_vk_matmul_pair(ColiVkTensor **t1p, float *y1, const void *w1, const float *s1, int O1,
                          ColiVkTensor **t2p, float *y2, const void *w2, const float *s2, int O2,
-                         int fmt, const float *x, int S, int I);
+                         int fmt, const float *x, int S, int I, int grp);
 
 /* Fused variant: absorb + resident o-projection ([Dout, H*V]) in one submit; ctx stays
  * on-device, only out [S,Dout] is read back. Falls back like absorb (returns 0). */
-int  coli_vk_attention_absorb_project(ColiVkTensor **kvb, const void *w, const float *sc, int fmt,
-                              ColiVkTensor **ot, const void *ow, const float *osc, int ofmt,
+int  coli_vk_attention_absorb_project(ColiVkTensor **kvb, const void *w, const float *sc, int fmt, int grp,
+                              ColiVkTensor **ot, const void *ow, const float *osc, int ofmt, int ogrp,
                               float *out, const float *q, int layer, int S, int H,
                               int Q, int R, int V, int K, int st0, int T, float scale, int Dout);
 

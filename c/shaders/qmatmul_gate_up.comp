@@ -21,9 +21,10 @@ layout(std430, binding = 4) readonly buffer SU { float uscale[]; };
 layout(std430, binding = 5) writeonly buffer H { float hid[]; };
 
 layout(push_constant) uniform P {
-    int fmt;        // 1=int8, 2=int4, 5=int3-g64
+    int fmt;        // 1=int8, 2=int4, 4=grouped int4, 5=int3-g64
     int S, I, O;    // I = input dim (hidden), O = moe_inter
     int rowWords;   // uint32 words per weight row (of the I-dim rows)
+    int gs;         // fmt=4 group size (multiple of 8; host gates otherwise)
 } p;
 
 shared float xsh[6144];
@@ -79,6 +80,16 @@ void main() {
                 g += ga * gscale[sb + uint(gi)];
                 u += ua * uscale[sb + uint(gi)];
             }
+        } else if (p.fmt == 4) { // grouped int4: nibble decode, per-word group scale (gs%8==0)
+            int words = (p.I + 7) / 8, ng = (p.I + p.gs - 1) / p.gs;
+            uint sb = uint(o) * uint(ng);
+            for (int wi = lane; wi < words; wi += sgsize) {
+                uint gp = wg[rb + uint(wi)], upk = wu[rb + uint(wi)]; int i0 = wi * 8;
+                float ga = 0.0, ua = 0.0;
+                for (int k = 0; k < 8; k++) { int i = i0 + k; if (i < p.I) { float xv = xsh[i]; ga += xv * i4(gp, k); ua += xv * i4(upk, k); } }
+                float sc_g = gscale[sb + uint(i0 / p.gs)], sc_u = uscale[sb + uint(i0 / p.gs)];
+                g += ga * sc_g; u += ua * sc_u;
+            }
         } else { // int4
             int words = (p.I + 7) / 8;
             for (int wi = lane; wi < words; wi += sgsize) {
@@ -87,7 +98,7 @@ void main() {
             }
         }
         float gt = subgroupAdd(g), ut = subgroupAdd(u);
-        if (p.fmt != 5) { gt *= gscale[o]; ut *= uscale[o]; }   // per-row formats only
+        if (p.fmt != 5 && p.fmt != 4) { gt *= gscale[o]; ut *= uscale[o]; }   // per-row formats only
         if (lane == 0) hid[s * p.O + o] = (gt / (1.0 + exp(-gt))) * ut;   // silu(gate)*up
     }
 }

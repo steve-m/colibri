@@ -337,18 +337,19 @@ static void qt_vk_reset(QT *t){
 /* Dense matmul on the Vulkan tier: y[S,O] = x[S,I] @ dequant(t)^T. Uploads the resident
  * int8/int4/int3-g64 weight once (t->vk), then reuses it. Returns 0 (caller runs the CPU
  * matmul) when VK-dense is off, the format is unsupported, or upload/compute fails. */
+#define VK_FMT_OK(t) ((t)->fmt==1||(t)->fmt==2||(t)->fmt==5||((t)->fmt==4&&(t)->gs>=8&&(t)->gs%8==0))
 static int vk_matmul_qt(QT *t, float *y, const float *x, int S){
-    if(!g_vk_dense || (t->fmt!=1 && t->fmt!=2 && t->fmt!=5)) return 0;
+    if(!g_vk_dense || !VK_FMT_OK(t)) return 0;
     const void *w = t->fmt==1 ? (const void*)t->q8 : (const void*)t->q4;
-    return coli_vk_matmul(&t->vk, y, x, w, t->s, t->fmt, S, t->I, t->O);
+    return coli_vk_matmul(&t->vk, y, x, w, t->s, t->fmt, S, t->I, t->O, t->gs);
 }
 /* Two same-input resident matmuls in one submit (q_a + kv_a read the same x). */
 static int vk_matmul_pair_qt(QT *a, float *ya, QT *b, float *yb, const float *x, int S){
-    if(!g_vk_dense || a->fmt!=b->fmt || (a->fmt!=1 && a->fmt!=2 && a->fmt!=5) || a->I!=b->I) return 0;
+    if(!g_vk_dense || a->fmt!=b->fmt || !VK_FMT_OK(a) || a->gs!=b->gs || a->I!=b->I) return 0;
     const void *wa = a->fmt==1 ? (const void*)a->q8 : (const void*)a->q4;
     const void *wb = b->fmt==1 ? (const void*)b->q8 : (const void*)b->q4;
     return coli_vk_matmul_pair(&a->vk, ya, wa, a->s, a->O,
-                               &b->vk, yb, wb, b->s, b->O, a->fmt, x, S, a->I);
+                               &b->vk, yb, wb, b->s, b->O, a->fmt, x, S, a->I, a->gs);
 }
 #endif
 #ifdef COLI_CUDA
@@ -2742,7 +2743,7 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
          * on rewrite/rebind/resize). Falls back to CPU on DSA top-k selection, ragged KV,
          * the MTP layer, or any backend failure — output identical either way. */
         if(!cuda_core&&g_vk_attn&&!kvs&&!positions&&S<=4&&layer<c->n_layers&&
-           (l->kv_b.fmt==1||l->kv_b.fmt==2||l->kv_b.fmt==5)&&kvl<=512&&c->qk_nope<=256&&c->qk_rope<=64&&
+           VK_FMT_OK(&l->kv_b)&&kvl<=512&&c->qk_nope<=256&&c->qk_rope<=64&&
            m->vk_kv_valid&&m->Lc[layer]&&m->Rc[layer]){   /* f32 KV only: a quantized-KV cache
                                                 * (upstream #399 KV8/TQ leaves Lc/Rc NULL)
                                                 * falls back to the CPU path until the VK
@@ -2758,15 +2759,15 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                     m->vk_kv_valid[layer]=T;
                     const void *kw=l->kv_b.fmt==1?(const void*)l->kv_b.q8:(const void*)l->kv_b.q4;
                     /* fused absorb + o-projection: ctx never leaves the device */
-                    if((l->o.fmt==1||l->o.fmt==2||l->o.fmt==5)&&
-                       coli_vk_attention_absorb_project(&l->kv_b.vk,kw,l->kv_b.s,l->kv_b.fmt,
+                    if(VK_FMT_OK(&l->o)&&
+                       coli_vk_attention_absorb_project(&l->kv_b.vk,kw,l->kv_b.s,l->kv_b.fmt,l->kv_b.gs,
                             &l->o.vk,l->o.fmt==1?(const void*)l->o.q8:(const void*)l->o.q4,
-                            l->o.s,l->o.fmt,out,Q,layer,S,H,c->qk_nope,c->qk_rope,
+                            l->o.s,l->o.fmt,l->o.gs,out,Q,layer,S,H,c->qk_nope,c->qk_rope,
                             vh,kvl,st0,T,c->attn_scale,D))
                         vk_core=vk_projected=1;
                     if(!vk_core)
                         vk_core=coli_vk_attention_absorb(&l->kv_b.vk,kw,
-                            l->kv_b.s,l->kv_b.fmt,ctx,Q,layer,S,H,c->qk_nope,c->qk_rope,
+                            l->kv_b.s,l->kv_b.fmt,l->kv_b.gs,ctx,Q,layer,S,H,c->qk_nope,c->qk_rope,
                             vh,kvl,st0,T,c->attn_scale);
                 }
             }
@@ -3910,9 +3911,9 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
         if(g_vk_dense && !omp_in_parallel() && (fsh==1||fsh==2||fsh==5) &&
            l->sh_up.fmt==fsh && l->sh_down.fmt==fsh){
             #define SW_(t) ((t).fmt==1?(const void*)(t).q8:(const void*)(t).q4)
-            if(coli_vk_tensor_ensure(&l->sh_gate.vk,SW_(l->sh_gate),l->sh_gate.s,fsh,D,sI)&&
-               coli_vk_tensor_ensure(&l->sh_up.vk,  SW_(l->sh_up),  l->sh_up.s,  fsh,D,sI)&&
-               coli_vk_tensor_ensure(&l->sh_down.vk,SW_(l->sh_down),l->sh_down.s,fsh,sI,D)){
+            if(coli_vk_tensor_ensure(&l->sh_gate.vk,SW_(l->sh_gate),l->sh_gate.s,fsh,D,sI,l->sh_gate.gs)&&
+               coli_vk_tensor_ensure(&l->sh_up.vk,  SW_(l->sh_up),  l->sh_up.s,  fsh,D,sI,l->sh_up.gs)&&
+               coli_vk_tensor_ensure(&l->sh_down.vk,SW_(l->sh_down),l->sh_down.s,fsh,sI,D,l->sh_down.gs)){
                 ColiVkTensor *vg=l->sh_gate.vk,*vu=l->sh_up.vk,*vd=l->sh_down.vk;
                 int rows1[1]={S};
                 if(coli_vk_expert_group(&vg,&vu,&vd,rows1,1,hh,x)) shared_cuda=1;
@@ -6354,16 +6355,18 @@ static void vk_registry_fill(Model *m){
                 if(++loadfail<4) fprintf(stderr,"[VK] tier fill: expert_load(%d,%d) failed\n",layer,eid);
                 if(loadfail>=64) break;                     /* disk trouble: stop burning time */
                 continue; } src=&tmp; }
-        int xf=src->g.fmt;   /* int4 (2) and int3-g64 (5) tiers; gate/up must share fmt for
-                              * the fused gate_up shader, down may differ per-projection */
-        if((xf!=2&&xf!=5)||src->u.fmt!=xf||(src->d.fmt!=2&&src->d.fmt!=5)){
+        int xf=src->g.fmt;   /* int4 (2), grouped int4 (4), int3-g64 (5) tiers; gate/up must
+                              * share fmt for the fused gate_up shader, down may differ */
+        if((xf!=2&&xf!=4&&xf!=5)||src->u.fmt!=xf||src->u.gs!=src->g.gs
+           ||(src->d.fmt!=2&&src->d.fmt!=4&&src->d.fmt!=5)
+           ||(xf==4&&(src->g.gs<8||src->g.gs%8))||(src->d.fmt==4&&(src->d.gs<8||src->d.gs%8))){
             if(tried<4) fprintf(stderr,"[VK] tier fill: (%d,%d) fmt %d/%d/%d not int4/int3-g64 (src=%s)\n",
                 layer,eid,src->g.fmt,src->u.fmt,src->d.fmt,src==&tmp?"load":"pin");
             continue; }
         ColiVkTensor **slot=vk_reg_at(layer,eid);
-        if(!coli_vk_tensor_ensure(&slot[0],src->g.q4,src->g.s,xf,c->hidden,c->moe_inter)||
-           !coli_vk_tensor_ensure(&slot[1],src->u.q4,src->u.s,xf,c->hidden,c->moe_inter)||
-           !coli_vk_tensor_ensure(&slot[2],src->d.q4,src->d.s,src->d.fmt,c->moe_inter,c->hidden)){
+        if(!coli_vk_tensor_ensure(&slot[0],src->g.q4,src->g.s,xf,c->hidden,c->moe_inter,src->g.gs)||
+           !coli_vk_tensor_ensure(&slot[1],src->u.q4,src->u.s,xf,c->hidden,c->moe_inter,src->u.gs)||
+           !coli_vk_tensor_ensure(&slot[2],src->d.q4,src->d.s,src->d.fmt,c->moe_inter,c->hidden,src->d.gs)){
             if(slot[0]){coli_vk_tensor_free(slot[0]);slot[0]=NULL;}
             if(slot[1]){coli_vk_tensor_free(slot[1]);slot[1]=NULL;}
             fprintf(stderr,"[VK] expert tier: VRAM full after %d experts\n",g_vk_reg_n);

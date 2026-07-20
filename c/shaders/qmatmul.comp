@@ -26,9 +26,10 @@ layout(std430, binding = 2) readonly buffer Sc { float scale[]; };
 layout(std430, binding = 3) writeonly buffer Y { float y[]; };
 
 layout(push_constant) uniform P {
-    int fmt;        // 1=int8, 2=int4, 5=int3-g64
+    int fmt;        // 1=int8, 2=int4, 4=grouped int4, 5=int3-g64
     int S, I, O;
     int rowWords;   // uint32 words per weight row
+    int gs;         // fmt=4 group size (multiple of 8; host gates otherwise)
 } p;
 
 // Max hidden dim across GLM expert matmuls is 6144 (24 KB LDS); down-proj uses 2048.
@@ -96,6 +97,18 @@ void main() {
                 }
                 sum += a * scale[sb + uint(g)];
             }
+        } else if (p.fmt == 4) { // grouped int4 (#298 semantics): nibble decode, one scale
+            // per gs inputs — gs % 8 == 0 (host-gated), so a packed word never straddles
+            // a group and its scale multiplies the 8-wide partial. Per-row scale must NOT run.
+            int words = (p.I + 7) / 8, ng = (p.I + p.gs - 1) / p.gs;
+            uint sb = uint(o) * uint(ng);
+            for (int wi = lane; wi < words; wi += sgsize) {
+                uint pk = w[rowBase + uint(wi)]; int i0 = wi * 8;
+                float a = 0.0;
+                for (int k = 0; k < 8; k++) { int i = i0 + k;
+                    if (i < p.I) a += (staged ? xsh[i] : x[xoff + i]) * i4(pk, k); }
+                sum += a * scale[sb + uint(i0 / p.gs)];
+            }
         } else { // int4
             int words = (p.I + 7) / 8;
             if (staged) for (int wi = lane; wi < words; wi += sgsize) {
@@ -107,6 +120,6 @@ void main() {
             }
         }
         float tot = subgroupAdd(sum);
-        if (lane == 0) y[s * p.O + o] = p.fmt == 5 ? tot : tot * scale[o];
+        if (lane == 0) y[s * p.O + o] = (p.fmt == 5 || p.fmt == 4) ? tot : tot * scale[o];
     }
 }

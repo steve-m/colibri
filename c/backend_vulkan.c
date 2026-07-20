@@ -22,7 +22,7 @@ struct ColiVkTensor {
     VkBuffer wbuf, sbuf;
     VkDeviceMemory wmem, smem;
     size_t wbytes;
-    int fmt, I, O, rowWords;
+    int fmt, I, O, rowWords, gs;
 };
 
 typedef struct {
@@ -96,9 +96,9 @@ static struct {
     float prio;                  /* priority applied to the NEXT allocations (class knob) */
 } G;
 
-struct PC { int fmt, S, I, O, rowWords; };
+struct PC { int fmt, S, I, O, rowWords, gs; };
 /* Push constants of the absorb attention kernel (must match attention_absorb.comp). */
-struct PCAttn { int fmt, S, H, Q, R, V, K, st0, T, rowWords, cap; float scale; };
+struct PCAttn { int fmt, S, H, Q, R, V, K, st0, T, rowWords, cap; float scale; int gs; };
 
 static int pick_memtype(void) {
     VkPhysicalDeviceMemoryProperties m;
@@ -200,8 +200,10 @@ static int rowwords(int fmt, int I) {
 }
 /* Scale floats per tensor: per-row formats carry O, int3-g64 carries O*ceil(I/64)
  * (one f32 per 64-input group). upload_tensor and tensor_free must agree on this. */
-static size_t scale_floats(int fmt, int I, int O) {
-    return fmt == 5 ? (size_t)O * (((size_t)I + 63) / 64) : (size_t)O;
+static size_t scale_floats(int fmt, int I, int O, int gs) {
+    if (fmt == 5) return (size_t)O * (((size_t)I + 63) / 64);
+    if (fmt == 4) return (size_t)O * (((size_t)I + gs - 1) / gs);   // per-group [O,ng]
+    return (size_t)O;
 }
 
 static VkShaderModule load_spv(const char *path) {
@@ -448,16 +450,17 @@ static int arena_suballoc(size_t bytes, VkBuffer *buf, void **ptr) {
 }
 
 static int upload_tensor(ColiVkTensor **out, const void *weights, const float *scales,
-                         int fmt, int I, int O) {
+                         int fmt, int I, int O, int gs) {
     if (*out) return (*out)->fmt == fmt && (*out)->I == I && (*out)->O == O;
-    if (fmt != 1 && fmt != 2 && fmt != 5) return 0;
+    if (fmt != 1 && fmt != 2 && fmt != 5 &&
+        !(fmt == 4 && gs >= 8 && gs % 8 == 0)) return 0;   /* fmt=4: word-aligned groups only */
     ColiVkTensor *t = calloc(1, sizeof(*t));
     if (!t) return 0;
-    t->fmt = fmt; t->I = I; t->O = O; t->rowWords = rowwords(fmt, I);
+    t->fmt = fmt; t->I = I; t->O = O; t->rowWords = rowwords(fmt, I); t->gs = fmt == 4 ? gs : 0;
     size_t stride = (size_t)t->rowWords * 4;         // padded row bytes
     size_t cpu_rb = fmt == 1 ? (size_t)I
                   : fmt == 5 ? ((size_t)I + 63) / 64 * 24 : (size_t)(I + 1) / 2;
-    size_t sfl = scale_floats(fmt, I, O);            // fmt=5: O*ceil(I/64) group scales
+    size_t sfl = scale_floats(fmt, I, O, gs);            // fmt=5: O*ceil(I/64) group scales
     t->wbytes = stride * (size_t)O;
     void *wptr;
     if (!arena_suballoc(t->wbytes, &t->wbuf, &wptr)) { free(t); return 0; }
@@ -480,9 +483,9 @@ static int upload_tensor(ColiVkTensor **out, const void *weights, const float *s
 
 /* Upload a resident tensor without computing (for the expert tier: gate/up/down are
  * uploaded once, then driven by coli_vk_expert_group). Returns 0 on failure. */
-int coli_vk_tensor_ensure(ColiVkTensor **tensor, const void *weights, const float *scales, int fmt, int I, int O) {
+int coli_vk_tensor_ensure(ColiVkTensor **tensor, const void *weights, const float *scales, int fmt, int I, int O, int grp) {
     if (!G.ready) return 0;
-    return upload_tensor(tensor, weights, scales, fmt, I, O);
+    return upload_tensor(tensor, weights, scales, fmt, I, O, grp);
 }
 
 /* Global submit/wait totals across EVERY synchronous GPU path (VK_PROF=1) — the
@@ -496,8 +499,8 @@ static void vkprof_tick(void) {
 
 int coli_vk_matmul(ColiVkTensor **tensor, float *y, const float *x,
                    const void *weights, const float *scales,
-                   int fmt, int S, int I, int O) {
-    if (!G.ready || S < 1 || !upload_tensor(tensor, weights, scales, fmt, I, O)) return 0;
+                   int fmt, int S, int I, int O, int gs) {
+    if (!G.ready || S < 1 || !upload_tensor(tensor, weights, scales, fmt, I, O, gs)) return 0;
     ColiVkTensor *t = *tensor;
     /* VK_PROF=1: phase split of the dense per-call cost, printed every 8192 calls —
      * separates our code (memcpy/desc/record) from the driver (submit) and the GPU
@@ -539,7 +542,7 @@ int coli_vk_matmul(ColiVkTensor **tensor, float *y, const float *x,
         VKCHECK(vkBeginCommandBuffer(G.cmd, &begin), "beginCmd");
         vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe);
         vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt, 0, 1, &G.dset, 0, NULL);
-        struct PC pc = {fmt, S, I, O, t->rowWords};
+        struct PC pc = {fmt, S, I, O, t->rowWords, t->gs};
         vkCmdPushConstants(G.cmd, G.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
         /* Grid-stride shader: one subgroup per output row (~8 rows/workgroup at wave32).
          * Launch ~O/8 workgroups for occupancy; the shader loops to cover any O / wave width. */
@@ -579,9 +582,9 @@ int coli_vk_matmul(ColiVkTensor **tensor, float *y, const float *x,
  * first call). D = input (hidden) dim, I = moe_inter. Returns 0 -> caller falls back. */
 int coli_vk_gate_up(ColiVkTensor **gate, ColiVkTensor **up, float *hidden, const float *x,
                     const void *gw, const float *gs, const void *uw, const float *us,
-                    int fmt, int S, int D, int I) {
+                    int fmt, int S, int D, int I, int grp) {
     if (!G.ready || !G.shader_gu || S < 1 || D > 6144) return 0;   /* shader stages x in xsh[6144] */
-    if (!upload_tensor(gate, gw, gs, fmt, D, I) || !upload_tensor(up, uw, us, fmt, D, I)) return 0;
+    if (!upload_tensor(gate, gw, gs, fmt, D, I, grp) || !upload_tensor(up, uw, us, fmt, D, I, grp)) return 0;
     ColiVkTensor *tg = *gate, *tu = *up;
     size_t xb = (size_t)S * D * sizeof(float), hb = (size_t)S * I * sizeof(float);
     if (!scratch_reserve(&G.x, xb) || !scratch_reserve_mt(&G.h, hb, G.memtype_cached)) return 0;  /* hidden read back */
@@ -603,7 +606,7 @@ int coli_vk_gate_up(ColiVkTensor **gate, ColiVkTensor **up, float *hidden, const
     VKCHECK(vkBeginCommandBuffer(G.cmd, &begin), "beginCmd");
     vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_gu);
     vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_gu, 0, 1, &G.dset_gu, 0, NULL);
-    struct PC pc = {fmt, S, D, I, tg->rowWords};   // PC.I = input D, PC.O = moe_inter I
+    struct PC pc = {fmt, S, D, I, tg->rowWords, tg->gs};   // PC.I = input D, PC.O = moe_inter I
     vkCmdPushConstants(G.cmd, G.plyt_gu, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
     vkCmdDispatch(G.cmd, (uint32_t)((I + 7) / 8), (uint32_t)S, 1);
     VKCHECK(vkEndCommandBuffer(G.cmd), "endCmd");
@@ -692,7 +695,7 @@ static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *up
     /* phase 1: fused gate+up+silu -> hidden (per expert, bound to its x/hidden slices) */
     vkCmdBindPipeline(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_gu);
     for (int c = 0; c < count; c++) {
-        struct PC pc = {fmt, rows[c], D, I, gates[c]->rowWords};
+        struct PC pc = {fmt, rows[c], D, I, gates[c]->rowWords, gates[c]->gs};
         vkCmdBindDescriptorSets(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_gu, 0, 1, &G.eg_gu[c], 0, NULL);
         vkCmdPushConstants(G.eg_cmd, G.plyt_gu, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
         vkCmdDispatch(G.eg_cmd, (uint32_t)((I + 7) / 8), (uint32_t)rows[c], 1);
@@ -701,7 +704,7 @@ static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *up
     /* phase 2: down projection hidden -> y */
     vkCmdBindPipeline(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe);
     for (int c = 0; c < count; c++) {
-        struct PC pc = {dfmt, rows[c], I, D, downs[c]->rowWords};
+        struct PC pc = {dfmt, rows[c], I, D, downs[c]->rowWords, downs[c]->gs};
         vkCmdBindDescriptorSets(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt, 0, 1, &G.eg_dn[c], 0, NULL);
         vkCmdPushConstants(G.eg_cmd, G.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
         vkCmdDispatch(G.eg_cmd, (uint32_t)((D + 7) / 8), (uint32_t)rows[c], 1);
@@ -805,14 +808,14 @@ void coli_vk_kv_reset(void) {
  * projected through the value rows of kv_b. kv_b ([H*(Q+V), K]) uploads on first
  * call and stays resident; L/R rows [st0, T) must already be mirrored via
  * coli_vk_kv_row. Returns 0 -> caller falls back to CPU. */
-int coli_vk_attention_absorb(ColiVkTensor **kvb, const void *w, const float *sc, int fmt,
+int coli_vk_attention_absorb(ColiVkTensor **kvb, const void *w, const float *sc, int fmt, int grp,
                              float *ctx, const float *q, int layer, int S, int H,
                              int Q, int R, int V, int K, int st0, int T, float scale) {
     if (!G.ready || !G.pipe_att || S < 1 || H < 1 || layer < 0 || layer >= VK_KV_LAYERS) return 0;
     if (Q > 256 || R > 64 || K > 512 || st0 < 0 || T - S - st0 < 0) return 0;  /* shared-array limits */
     VkKvLayer *kv = &G.kv[layer];
     if (!kv->bl || kv->rows < T || kv->K != K || kv->R != R) return 0;
-    if (!upload_tensor(kvb, w, sc, fmt, K, H * (Q + V))) return 0;
+    if (!upload_tensor(kvb, w, sc, fmt, K, H * (Q + V), grp)) return 0;
     ColiVkTensor *t = *kvb;
     int cap = T - st0;
     size_t qb = (size_t)S * H * (Q + R) * 4, cb = (size_t)S * H * V * 4;
@@ -838,7 +841,7 @@ int coli_vk_attention_absorb(ColiVkTensor **kvb, const void *w, const float *sc,
     VKCHECK(vkBeginCommandBuffer(G.cmd, &begin), "beginCmd");
     vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_att);
     vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_att, 0, 1, &G.dset_att, 0, NULL);
-    struct PCAttn pc = {fmt, S, H, Q, R, V, K, st0, T, t->rowWords, cap, scale};
+    struct PCAttn pc = {fmt, S, H, Q, R, V, K, st0, T, t->rowWords, cap, scale, t->gs};
     vkCmdPushConstants(G.cmd, G.plyt_att, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
     vkCmdDispatch(G.cmd, (uint32_t)H, (uint32_t)S, 1);     /* one workgroup per (head, row) */
     VKCHECK(vkEndCommandBuffer(G.cmd), "endCmd");
@@ -861,9 +864,9 @@ int coli_vk_attention_absorb(ColiVkTensor **kvb, const void *w, const float *sc,
  * cached memory. Returns 0 -> caller falls back to the single-matmul path. */
 int coli_vk_matmul_pair(ColiVkTensor **t1p, float *y1, const void *w1, const float *s1, int O1,
                         ColiVkTensor **t2p, float *y2, const void *w2, const float *s2, int O2,
-                        int fmt, const float *x, int S, int I) {
+                        int fmt, const float *x, int S, int I, int grp) {
     if (!G.ready || S < 1) return 0;
-    if (!upload_tensor(t1p, w1, s1, fmt, I, O1) || !upload_tensor(t2p, w2, s2, fmt, I, O2)) return 0;
+    if (!upload_tensor(t1p, w1, s1, fmt, I, O1, grp) || !upload_tensor(t2p, w2, s2, fmt, I, O2, grp)) return 0;
     ColiVkTensor *t1 = *t1p, *t2 = *t2p;
     size_t xb = (size_t)S * I * 4, yb1 = (size_t)S * O1 * 4, yb2 = (size_t)S * O2 * 4;
     if (!scratch_reserve(&G.x, xb) || !scratch_reserve_mt(&G.y, yb1, G.memtype_cached) ||
@@ -892,11 +895,11 @@ int coli_vk_matmul_pair(ColiVkTensor **t1p, float *y1, const void *w1, const flo
     VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     VKCHECK(vkBeginCommandBuffer(G.cmd, &begin), "beginCmd");
     vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe);
-    struct PC pc1 = {fmt, S, I, O1, t1->rowWords};
+    struct PC pc1 = {fmt, S, I, O1, t1->rowWords, t1->gs};
     vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt, 0, 1, &G.dset, 0, NULL);
     vkCmdPushConstants(G.cmd, G.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc1), &pc1);
     vkCmdDispatch(G.cmd, (uint32_t)((O1 + 7) / 8), (uint32_t)S, 1);
-    struct PC pc2 = {fmt, S, I, O2, t2->rowWords};
+    struct PC pc2 = {fmt, S, I, O2, t2->rowWords, t2->gs};
     vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt, 0, 1, &G.dset_pair, 0, NULL);
     vkCmdPushConstants(G.cmd, G.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc2), &pc2);
     vkCmdDispatch(G.cmd, (uint32_t)((O2 + 7) / 8), (uint32_t)S, 1);
@@ -920,8 +923,8 @@ int coli_vk_matmul_pair(ColiVkTensor **t1p, float *y1, const void *w1, const flo
  * runs on it via the plain matmul pipeline — only out [S,Dout] returns to the host.
  * Kills the per-layer ctx readback + re-upload + second submit of the unfused path.
  * Returns 0 -> caller falls back (plain absorb or CPU). */
-int coli_vk_attention_absorb_project(ColiVkTensor **kvb, const void *w, const float *sc, int fmt,
-                                     ColiVkTensor **ot, const void *ow, const float *osc, int ofmt,
+int coli_vk_attention_absorb_project(ColiVkTensor **kvb, const void *w, const float *sc, int fmt, int grp,
+                                     ColiVkTensor **ot, const void *ow, const float *osc, int ofmt, int ogrp,
                                      float *out, const float *q, int layer, int S, int H,
                                      int Q, int R, int V, int K, int st0, int T, float scale,
                                      int Dout) {
@@ -929,8 +932,8 @@ int coli_vk_attention_absorb_project(ColiVkTensor **kvb, const void *w, const fl
     if (Q > 256 || R > 64 || K > 512 || st0 < 0 || T - S - st0 < 0 || Dout < 1) return 0;
     VkKvLayer *kv = &G.kv[layer];
     if (!kv->bl || kv->rows < T || kv->K != K || kv->R != R) return 0;
-    if (!upload_tensor(kvb, w, sc, fmt, K, H * (Q + V))) return 0;
-    if (!upload_tensor(ot, ow, osc, ofmt, H * V, Dout)) return 0;
+    if (!upload_tensor(kvb, w, sc, fmt, K, H * (Q + V), grp)) return 0;
+    if (!upload_tensor(ot, ow, osc, ofmt, H * V, Dout, ogrp)) return 0;
     ColiVkTensor *t = *kvb, *to = *ot;
     int cap = T - st0;
     size_t qb = (size_t)S * H * (Q + R) * 4, cb = (size_t)S * H * V * 4;
@@ -960,7 +963,7 @@ int coli_vk_attention_absorb_project(ColiVkTensor **kvb, const void *w, const fl
     VKCHECK(vkBeginCommandBuffer(G.cmd, &begin), "beginCmd");
     vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_att);
     vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_att, 0, 1, &G.dset_att, 0, NULL);
-    struct PCAttn pc = {fmt, S, H, Q, R, V, K, st0, T, t->rowWords, cap, scale};
+    struct PCAttn pc = {fmt, S, H, Q, R, V, K, st0, T, t->rowWords, cap, scale, t->gs};
     vkCmdPushConstants(G.cmd, G.plyt_att, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
     vkCmdDispatch(G.cmd, (uint32_t)H, (uint32_t)S, 1);
     VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
@@ -969,7 +972,7 @@ int coli_vk_attention_absorb_project(ColiVkTensor **kvb, const void *w, const fl
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
     vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe);
     vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt, 0, 1, &G.dset, 0, NULL);
-    struct PC opc = {ofmt, S, H * V, Dout, to->rowWords};
+    struct PC opc = {ofmt, S, H * V, Dout, to->rowWords, to->gs};
     vkCmdPushConstants(G.cmd, G.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(opc), &opc);
     vkCmdDispatch(G.cmd, (uint32_t)((Dout + 7) / 8), (uint32_t)S, 1);
     VKCHECK(vkEndCommandBuffer(G.cmd), "endCmd");
@@ -1000,7 +1003,7 @@ void coli_vk_tensor_free(ColiVkTensor *t) {
     // Mirror upload_tensor exactly (weights + scales), atomically — otherwise
     // used_bytes leaks the scales buffer on every free and drifts upward.
     __atomic_sub_fetch(&G.tensor_count, 1, __ATOMIC_RELAXED);
-    __atomic_sub_fetch(&G.used_bytes, t->wbytes + scale_floats(t->fmt, t->I, t->O) * sizeof(float), __ATOMIC_RELAXED);
+    __atomic_sub_fetch(&G.used_bytes, t->wbytes + scale_floats(t->fmt, t->I, t->O, t->gs) * sizeof(float), __ATOMIC_RELAXED);
     free(t);
 }
 
@@ -1062,11 +1065,14 @@ void coli_vk_shutdown(void) {
 static double now(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec + ts.tv_nsec / 1e9; }
 
+static int g_ref_gs = 64;   /* fmt=4 group size the harness cases use */
 static size_t ref_rowbytes(int fmt, int I) {
     return fmt == 1 ? (size_t)I : fmt == 5 ? (size_t)((I + 63) / 64) * 24 : (size_t)(I + 1) / 2;
 }
-static size_t ref_scales(int fmt, int I, int O) {   // scale COUNT (fmt=5: per 64-group)
-    return fmt == 5 ? (size_t)O * (size_t)((I + 63) / 64) : (size_t)O;
+static size_t ref_scales(int fmt, int I, int O) {   // scale COUNT (per-group for fmt 4/5)
+    if (fmt == 5) return (size_t)O * (size_t)((I + 63) / 64);
+    if (fmt == 4) return (size_t)O * (size_t)((I + g_ref_gs - 1) / g_ref_gs);
+    return (size_t)O;
 }
 static float deq(const uint8_t *row, int fmt, int i) {
     if (fmt == 1) { int b = ((const int8_t *)row)[i]; return (float)b; }
@@ -1080,13 +1086,13 @@ static float deq(const uint8_t *row, int fmt, int i) {
 static void cpu_ref(float *y, const float *x, const uint8_t *w, const float *sc,
                     int fmt, int S, int I, int O) {
     size_t rb = ref_rowbytes(fmt, I);
-    int ng = (I + 63) / 64;
+    int gw2 = fmt == 4 ? g_ref_gs : 64, ng = (I + gw2 - 1) / gw2;
     for (int s = 0; s < S; s++) for (int o = 0; o < O; o++) {
         double sum = 0; const uint8_t *row = w + (size_t)o * rb;
-        if (fmt == 5) {   // per-group scales fold inside the sum
+        if (fmt == 5 || fmt == 4) {   // per-group scales fold inside the sum
             for (int g = 0; g < ng; g++) {
-                double a = 0; int end = (g + 1) * 64 < I ? (g + 1) * 64 : I;
-                for (int i = g * 64; i < end; i++) a += x[s * I + i] * deq(row, fmt, i);
+                double a = 0; int end = (g + 1) * gw2 < I ? (g + 1) * gw2 : I;
+                for (int i = g * gw2; i < end; i++) a += x[s * I + i] * deq(row, fmt, i);
                 sum += a * sc[(size_t)o * ng + g];
             }
             y[s * O + o] = (float)sum;
@@ -1100,11 +1106,12 @@ static void cpu_ref(float *y, const float *x, const uint8_t *w, const float *sc,
 /* dequant dot of one weight row against x with that row's scales applied —
  * per-row for fmt 1/2, per 64-group for fmt=5. scb = tensor scale array, o = row. */
 static double ref_dot(const float *x, const uint8_t *row, const float *scb, int o, int fmt, int I) {
-    if (fmt == 5) {
-        int ng = (I + 63) / 64; double sum = 0;
+    if (fmt == 5 || fmt == 4) {
+        int gw2 = fmt == 4 ? g_ref_gs : 64;
+        int ng = (I + gw2 - 1) / gw2; double sum = 0;
         for (int g = 0; g < ng; g++) {
-            double a = 0; int end = (g + 1) * 64 < I ? (g + 1) * 64 : I;
-            for (int i = g * 64; i < end; i++) a += x[i] * deq(row, fmt, i);
+            double a = 0; int end = (g + 1) * gw2 < I ? (g + 1) * gw2 : I;
+            for (int i = g * gw2; i < end; i++) a += x[i] * deq(row, fmt, i);
             sum += a * scb[(size_t)o * ng + g];
         }
         return sum;
@@ -1126,7 +1133,7 @@ static int run_case(int fmt, int S, int I, int O, int iters) {
     for (size_t o = 0; o < nsc; o++) sc[o] = 0.01f + (rand() % 100) / 10000.0f;
 
     ColiVkTensor *t = NULL;
-    if (!coli_vk_matmul(&t, yg, x, w, sc, fmt, S, I, O)) { printf("matmul failed\n"); return 1; }
+    if (!coli_vk_matmul(&t, yg, x, w, sc, fmt, S, I, O, g_ref_gs)) { printf("matmul failed\n"); return 1; }
     cpu_ref(yc, x, w, sc, fmt, S, I, O);
     double maxerr = 0, maxrel = 0;
     for (int i = 0; i < S * O; i++) {
@@ -1135,7 +1142,7 @@ static int run_case(int fmt, int S, int I, int O, int iters) {
     }
     // microbench (GPU)
     double t0 = now();
-    for (int k = 0; k < iters; k++) coli_vk_matmul(&t, yg, x, w, sc, fmt, S, I, O);
+    for (int k = 0; k < iters; k++) coli_vk_matmul(&t, yg, x, w, sc, fmt, S, I, O, g_ref_gs);
     double gpu_ms = (now() - t0) * 1000 / iters;
     // microbench (CPU ref, 1 iter — it's slow)
     double c0 = now(); cpu_ref(yc, x, w, sc, fmt, S, I, O); double cpu_ms = (now() - c0) * 1000;
@@ -1158,7 +1165,7 @@ static double bench_batched(ColiVkTensor *t, const float *x, int fmt, int S, int
     vkBeginCommandBuffer(G.cmd, &begin);
     vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe);
     vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt, 0, 1, &G.dset, 0, NULL);
-    struct PC pc = {fmt, S, I, O, t->rowWords};
+    struct PC pc = {fmt, S, I, O, t->rowWords, t->gs};
     vkCmdPushConstants(G.cmd, G.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
     VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
         .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT};
@@ -1192,7 +1199,7 @@ static int run_gate_up(int fmt, int S, int D, int I) {
     for (size_t i = 0; i < rb*I; i++) { gw[i] = rand()&0xff; uw[i] = rand()&0xff; }
     for (size_t o = 0; o < nsc; o++) { gs[o] = 0.01f+(rand()%100)/10000.0f; us[o] = 0.01f+(rand()%100)/10000.0f; }
     ColiVkTensor *tg = NULL, *tu = NULL;
-    if (!coli_vk_gate_up(&tg, &tu, hg, x, gw, gs, uw, us, fmt, S, D, I)) { printf("gate_up failed\n"); return 1; }
+    if (!coli_vk_gate_up(&tg, &tu, hg, x, gw, gs, uw, us, fmt, S, D, I, g_ref_gs)) { printf("gate_up failed\n"); return 1; }
     for (int s = 0; s < S; s++) for (int o = 0; o < I; o++) {
         float gt = (float)ref_dot(x+(size_t)s*D, gw+(size_t)o*rb, gs, o, fmt, D);
         float ut = (float)ref_dot(x+(size_t)s*D, uw+(size_t)o*rb, us, o, fmt, D);
@@ -1214,7 +1221,7 @@ static double bench_gu_batched(ColiVkTensor *tg, const float *x, int fmt, int S,
     vkBeginCommandBuffer(G.cmd, &begin);
     vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_gu);
     vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_gu, 0, 1, &G.dset_gu, 0, NULL);
-    struct PC pc = {fmt, S, D, I, tg->rowWords};
+    struct PC pc = {fmt, S, D, I, tg->rowWords, tg->gs};
     vkCmdPushConstants(G.cmd, G.plyt_gu, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
     VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
         .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT};
@@ -1243,7 +1250,7 @@ static double bench_experts_fair(int fmt, int D, int I, int K, int Npass) {
         uint8_t *gw = malloc(rb*I), *uw = malloc(rb*I); float *gs = malloc(nsc*4), *us = malloc(nsc*4);
         for (size_t i = 0; i < rb*I; i++) { gw[i] = rand()&0xff; uw[i] = rand()&0xff; }
         for (size_t o = 0; o < nsc; o++) { gs[o] = 0.01f; us[o] = 0.01f; }
-        coli_vk_gate_up(&tg[c], &tu[c], h, x, gw, gs, uw, us, fmt, 1, D, I);   /* uploads distinct experts */
+        coli_vk_gate_up(&tg[c], &tu[c], h, x, gw, gs, uw, us, fmt, 1, D, I, g_ref_gs);   /* uploads distinct experts */
         free(gw); free(uw); free(gs); free(us);
     }
     VkDescriptorPoolSize ps = {.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = (uint32_t)(6*K)};
@@ -1262,7 +1269,7 @@ static double bench_experts_fair(int fmt, int D, int I, int K, int Npass) {
     VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     vkBeginCommandBuffer(G.cmd, &begin);
     vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_gu);
-    struct PC pc = {fmt, 1, D, I, tg[0]->rowWords};
+    struct PC pc = {fmt, 1, D, I, tg[0]->rowWords, tg[0]->gs};
     vkCmdPushConstants(G.cmd, G.plyt_gu, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
     VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT};
     for (int pass = 0; pass < Npass; pass++) for (int c = 0; c < K; c++) {
@@ -1300,9 +1307,9 @@ static int run_expert_group(int fmt, int D, int I, int K) {
         hgs[c] = malloc(gu_sc*4); hus[c] = malloc(gu_sc*4); hds[c] = malloc(d_sc*4);
         for (size_t o = 0; o < gu_sc; o++) { hgs[c][o] = 0.01f+(rand()%100)/10000.0f; hus[c][o] = 0.01f+(rand()%100)/10000.0f; }
         for (size_t o = 0; o < d_sc; o++) hds[c][o] = 0.01f+(rand()%100)/10000.0f;
-        coli_vk_matmul(&tg[c], tmp, x, hgw[c], hgs[c], fmt, 1, D, I);   /* upload gate  (D->I) */
-        coli_vk_matmul(&tu[c], tmp, x, huw[c], hus[c], fmt, 1, D, I);   /* upload up    (D->I) */
-        coli_vk_matmul(&td[c], tmp, x, hdw[c], hds[c], fmt, 1, I, D);   /* upload down  (I->D) */
+        coli_vk_matmul(&tg[c], tmp, x, hgw[c], hgs[c], fmt, 1, D, I, g_ref_gs);   /* upload gate  (D->I) */
+        coli_vk_matmul(&tu[c], tmp, x, huw[c], hus[c], fmt, 1, D, I, g_ref_gs);   /* upload up    (D->I) */
+        coli_vk_matmul(&td[c], tmp, x, hdw[c], hds[c], fmt, 1, I, D, g_ref_gs);   /* upload down  (I->D) */
     }
     int rows[64]; for (int c = 0; c < K; c++) rows[c] = 1;
     if (!coli_vk_expert_group(tg, tu, td, rows, K, yg, x)) { printf("expert_group failed\n"); return 1; }
@@ -1377,7 +1384,7 @@ static int run_absorb(int fmt, int S, int H, int Q, int R, int V, int K, int st0
     for (int t = 0; t < T; t++)
         if (!coli_vk_kv_row(layer, t, L + (size_t)t * K, Rr + (size_t)t * R)) { printf("kv_row failed\n"); return 1; }
     ColiVkTensor *kvb = NULL;
-    if (!coli_vk_attention_absorb(&kvb, w, ws, fmt, cg, q, layer, S, H, Q, R, V, K, st0, T, scale)) {
+    if (!coli_vk_attention_absorb(&kvb, w, ws, fmt, g_ref_gs, cg, q, layer, S, H, Q, R, V, K, st0, T, scale)) {
         printf("absorb failed\n"); return 1; }
     float *qabs = malloc((size_t)K * 4), *clat = malloc((size_t)K * 4), *sc = malloc((size_t)(T - st0) * 4);
     for (int s = 0; s < S; s++) for (int h = 0; h < H; h++) {
@@ -1386,7 +1393,9 @@ static int run_absorb(int fmt, int S, int H, int Q, int R, int V, int K, int st0
         for (int i = 0; i < K; i++) qabs[i] = 0;
         for (int d = 0; d < Q; d++) { const uint8_t *row = w + (size_t)(rbase + d) * rb;
             for (int i = 0; i < K; i++) {
-                float sw = fmt == 5 ? ws[(size_t)(rbase + d) * ngK + (i >> 6)] : ws[rbase + d];
+                float sw = fmt == 5 ? ws[(size_t)(rbase + d) * ngK + (i >> 6)]
+                         : fmt == 4 ? ws[(size_t)(rbase + d) * ((K + g_ref_gs - 1) / g_ref_gs) + i / g_ref_gs]
+                         : ws[rbase + d];
                 qabs[i] += qp[d] * deq(row, fmt, i) * sw; } }
         for (int j = 0; j < nt; j++) { int t = st0 + j;
             double a = 0;
@@ -1407,7 +1416,7 @@ static int run_absorb(int fmt, int S, int H, int Q, int R, int V, int K, int st0
         if (fabs(cc[i]) > 1e-2) { double r = e / fabs(cc[i]); if (r > maxrel) maxrel = r; } }
     double t0 = now(); int iters = 20;   /* per-call cost, the engine pattern (one submit/layer) */
     for (int k = 0; k < iters; k++)
-        coli_vk_attention_absorb(&kvb, w, ws, fmt, cg, q, layer, S, H, Q, R, V, K, st0, T, scale);
+        coli_vk_attention_absorb(&kvb, w, ws, fmt, g_ref_gs, cg, q, layer, S, H, Q, R, V, K, st0, T, scale);
     double ms = (now() - t0) * 1000 / iters;
     printf("absorb fmt=%d S=%d H=%d Q=%d R=%d V=%d K=%d st0=%d T=%d | maxerr=%.4g maxrel=%.4g | %.3f ms/call\n",
            fmt, S, H, Q, R, V, K, st0, T, maxerr, maxrel, ms);
@@ -1418,7 +1427,7 @@ static int run_absorb(int fmt, int S, int H, int Q, int R, int V, int K, int st0
     for (size_t i = 0; i < orb * (size_t)Dout; i++) owt[i] = rand() & 0xff;
     for (size_t o = 0; o < onsc; o++) osc[o] = 0.01f + (rand() % 100) / 10000.0f;
     ColiVkTensor *ot = NULL;
-    if (!coli_vk_attention_absorb_project(&kvb, w, ws, fmt, &ot, owt, osc, fmt,
+    if (!coli_vk_attention_absorb_project(&kvb, w, ws, fmt, g_ref_gs, &ot, owt, osc, fmt, g_ref_gs,
             og, q, layer, S, H, Q, R, V, K, st0, T, scale, Dout)) { printf("absorb_project failed\n"); return 1; }
     cpu_ref(oc, cc, owt, osc, fmt, S, H * V, Dout);
     double pmaxrel = 0;
@@ -1426,7 +1435,7 @@ static int run_absorb(int fmt, int S, int H, int Q, int R, int V, int K, int st0
         if (fabs(oc[i]) > 1e-2) { double r = e / fabs(oc[i]); if (r > pmaxrel) pmaxrel = r; } }
     t0 = now();
     for (int k = 0; k < iters; k++)
-        coli_vk_attention_absorb_project(&kvb, w, ws, fmt, &ot, owt, osc, fmt,
+        coli_vk_attention_absorb_project(&kvb, w, ws, fmt, g_ref_gs, &ot, owt, osc, fmt, g_ref_gs,
             og, q, layer, S, H, Q, R, V, K, st0, T, scale, Dout);
     printf("absorb+project fused                  | maxrel=%.4g | %.3f ms/call (unfused absorb was %.3f)\n",
            pmaxrel, (now() - t0) * 1000 / iters, ms);
@@ -1474,7 +1483,7 @@ int main(int argc, char **argv) {
         for (size_t i = 0; i < (size_t)(I + 1) / 2 * O; i++) w[i] = rand() & 0xff;
         for (int o = 0; o < O; o++) sc[o] = 0.01f + (rand() % 100) / 10000.0f;
         float *y = malloc((size_t)O * 4);
-        ColiVkTensor *t = NULL; coli_vk_matmul(&t, y, x, w, sc, 2, 1, I, O);   /* bind */
+        ColiVkTensor *t = NULL; coli_vk_matmul(&t, y, x, w, sc, 2, 1, I, O, 0);   /* bind */
         printf("BATCHED int4 S=1 6144->2048 (our gate/up): %.4f ms/matmul (N=64, one submit)\n",
                bench_batched(t, x, 2, 1, I, O, 64));
         coli_vk_tensor_free(t); free(x); free(w); free(sc); free(y);
@@ -1484,7 +1493,7 @@ int main(int argc, char **argv) {
         for (size_t i = 0; i < (size_t)(I + 1) / 2 * O; i++) w[i] = rand() & 0xff;
         for (int o = 0; o < O; o++) sc[o] = 0.01f + (rand() % 100) / 10000.0f;
         y = malloc((size_t)O * 4);
-        t = NULL; coli_vk_matmul(&t, y, x, w, sc, 2, 1, I, O);
+        t = NULL; coli_vk_matmul(&t, y, x, w, sc, 2, 1, I, O, 0);
         printf("BATCHED int4 S=1 2048->6144 (our down):    %.4f ms/matmul (N=64, one submit)\n",
                bench_batched(t, x, 2, 1, I, O, 64));
         coli_vk_tensor_free(t); free(x); free(w); free(sc); free(y);
@@ -1500,7 +1509,7 @@ int main(int argc, char **argv) {
         for (int i = 0; i < D; i++) x[i] = (rand()%200-100)/100.0f;
         for (size_t i = 0; i < rb*I; i++) { gw[i] = rand()&0xff; uw[i] = rand()&0xff; }
         for (int o = 0; o < I; o++) { gs[o] = 0.01f; us[o] = 0.01f; }
-        ColiVkTensor *tg = NULL, *tu = NULL; coli_vk_gate_up(&tg, &tu, h, x, gw, gs, uw, us, 2, 1, D, I);
+        ColiVkTensor *tg = NULL, *tu = NULL; coli_vk_gate_up(&tg, &tu, h, x, gw, gs, uw, us, 2, 1, D, I, 0);
         printf("BATCHED fused gate_up int4 6144->2048:     %.4f ms (N=64, SAME expert = L2-cached)\n",
                bench_gu_batched(tg, x, 2, 1, D, I, 64));
         coli_vk_tensor_free(tg); coli_vk_tensor_free(tu); free(x); free(gw); free(uw); free(gs); free(us); free(h);
@@ -1517,12 +1526,22 @@ int main(int argc, char **argv) {
     bad |= run_expert_group(2, 6144, 2048, 32);
     /* int3-g64 expert group: correctness + the 0.86x-bytes throughput question.
      * count=1 included — it is the SHARED-expert path shape in the engine. */
+    /* fmt=4 grouped int4 (#298 semantics), gs=64 across real shapes + gs=32 sanity */
+    g_ref_gs = 64;
+    bad |= run_case(4, 1, 6144, 2048, 50);
+    bad |= run_case(4, 1, 2048, 6144, 50);
+    bad |= run_case(4, 8, 6144, 1536, 20);
+    bad |= run_case(4, 1, 16384, 6144, 10);
+    g_ref_gs = 32;
+    bad |= run_case(4, 1, 6144, 2048, 20);
+    g_ref_gs = 64;
+    bad |= run_expert_group(4, 6144, 2048, 8);
     bad |= run_expert_group(5, 6144, 2048, 1);
     bad |= run_expert_group(5, 6144, 2048, 8);
     bad |= run_expert_group(5, 6144, 2048, 32);
     /* Fused same-input matmul pair (the q_a + kv_a prologue pattern), int4 AND int3. */
-    for (int pi = 0; pi < 2; pi++) {
-        int pf = pi == 0 ? 2 : 5;
+    for (int pi = 0; pi < 3; pi++) {
+        int pf = pi == 0 ? 2 : pi == 1 ? 5 : 4;
         int I = 6144, O1 = 2048, O2 = 576, S = 1;
         size_t rb = ref_rowbytes(pf, I);
         size_t n1 = ref_scales(pf, I, O1), n2 = ref_scales(pf, I, O2);
@@ -1536,7 +1555,7 @@ int main(int argc, char **argv) {
         for (size_t o = 0; o < n2; o++) s2[o] = 0.01f + (rand() % 100) / 10000.0f;
         for (int i = 0; i < I; i++) x[i] = (rand() % 200 - 100) / 100.0f;
         ColiVkTensor *t1 = NULL, *t2 = NULL;
-        if (!coli_vk_matmul_pair(&t1, y1, w1, s1, O1, &t2, y2, w2, s2, O2, pf, x, S, I)) {
+        if (!coli_vk_matmul_pair(&t1, y1, w1, s1, O1, &t2, y2, w2, s2, O2, pf, x, S, I, g_ref_gs)) {
             printf("matmul_pair fmt=%d failed\n", pf); bad = 1;
         } else {
             cpu_ref(c1, x, w1, s1, pf, S, I, O1); cpu_ref(c2, x, w2, s2, pf, S, I, O2);
@@ -1544,7 +1563,7 @@ int main(int argc, char **argv) {
             for (int i = 0; i < O1; i++) { double e = fabs(y1[i]-c1[i]); if (fabs(c1[i])>1e-2) { double r=e/fabs(c1[i]); if (r>mr) mr=r; } }
             for (int i = 0; i < O2; i++) { double e = fabs(y2[i]-c2[i]); if (fabs(c2[i])>1e-2) { double r=e/fabs(c2[i]); if (r>mr) mr=r; } }
             double t0 = now();
-            for (int k = 0; k < 30; k++) coli_vk_matmul_pair(&t1, y1, w1, s1, O1, &t2, y2, w2, s2, O2, pf, x, S, I);
+            for (int k = 0; k < 30; k++) coli_vk_matmul_pair(&t1, y1, w1, s1, O1, &t2, y2, w2, s2, O2, pf, x, S, I, g_ref_gs);
             printf("matmul_pair fmt=%d 6144->(2048,576)   | maxrel=%.4g | %.3f ms/pair-call\n", pf, mr, (now()-t0)*1000/30);
             bad |= mr > 1e-3;
         }
@@ -1560,6 +1579,8 @@ int main(int argc, char **argv) {
         bad |= run_absorb(2, 1, 64, 192, 64, 256, 512, 0, 2000, 4);   // long context
         bad |= run_absorb(5, 1, 64, 192, 64, 256, 512, 0, 300, 5);    // int3-g64 kv_b + o
         bad |= run_absorb(5, 2, 64, 192, 64, 256, 512, 17, 300, 6);   // int3 S=2 causal + window
+        bad |= run_absorb(4, 1, 64, 192, 64, 256, 512, 0, 300, 7);    // grouped-int4 kv_b + o
+        bad |= run_absorb(4, 2, 64, 192, 64, 256, 512, 17, 300, 8);   // fmt=4 S=2 causal + window
     }
     printf(bad ? "FAIL\n" : "PASS\n");
     coli_vk_shutdown();

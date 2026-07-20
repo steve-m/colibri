@@ -33,6 +33,7 @@ layout(push_constant) uniform P {
     int rowWords;   // uint32 words per kv_b row (K-dim)
     int cap;        // score scratch stride per (s,h) = T-st0
     float scale;    // attention scale
+    int gs;         // fmt=4 group size (multiple of 8; host gates otherwise)
 } p;
 
 shared float qsc[256];    // q_nope pre-multiplied by its row scale
@@ -70,7 +71,7 @@ void main() {
     // Row-scale formats fold each kv_b row's scale into the query element once (the
     // scale factors out of the i-sum). fmt=5 scales vary along i (per 64-group), so
     // qsc[] stays UNSCALED and the (row,group) scale applies inside pass 1.
-    for (int d = tid; d < p.Q; d += nth) qsc[d] = p.fmt == 5 ? q[qoff + d] : q[qoff + d] * wsc[rbase + d];
+    for (int d = tid; d < p.Q; d += nth) qsc[d] = (p.fmt == 5 || p.fmt == 4) ? q[qoff + d] : q[qoff + d] * wsc[rbase + d];
     for (int d = tid; d < p.R; d += nth) qr[d] = q[qoff + p.Q + d];
     barrier();
 
@@ -85,6 +86,10 @@ void main() {
             int gi = i >> 6;                        // this thread's i sits in ONE group per row
             for (int d = 0; d < p.Q; d++)
                 acc += qsc[d] * i3v(rbase + d, i) * wsc[(rbase + d) * ng + gi];
+        } else if (p.fmt == 4) {                    // grouped int4: nibble + per-group scale
+            int wi = i >> 3, l = i & 7, gi = i / p.gs, ng4 = (p.K + p.gs - 1) / p.gs;
+            for (int d = 0; d < p.Q; d++)
+                acc += qsc[d] * i4(w[(rbase + d) * p.rowWords + wi], l) * wsc[(rbase + d) * ng4 + gi];
         } else {
             int wi = i >> 3, l = i & 7;
             for (int d = 0; d < p.Q; d++) acc += qsc[d] * i4(w[(rbase + d) * p.rowWords + wi], l);
@@ -150,6 +155,14 @@ void main() {
                 }
                 acc += a * wsc[row * ng + g];
             }
+        } else if (p.fmt == 4) {   // grouped int4: per-word group scale (gs%8==0, host-gated)
+            int words = (p.K + 7) / 8, ng4 = (p.K + p.gs - 1) / p.gs;
+            for (int wi = lane; wi < words; wi += sgsize) {
+                uint pk = w[rb + uint(wi)]; int i0 = wi * 8;
+                float a = 0.0;
+                for (int k = 0; k < 8; k++) { int i = i0 + k; if (i < p.K) a += clat[i] * i4(pk, k); }
+                acc += a * wsc[row * ng4 + uint(i0 / p.gs)];
+            }
         } else {
             int words = (p.K + 7) / 8;
             for (int wi = lane; wi < words; wi += sgsize) {
@@ -158,6 +171,6 @@ void main() {
             }
         }
         float tot = subgroupAdd(acc);
-        if (lane == 0) ctx[(s * p.H + h) * p.V + v] = p.fmt == 5 ? tot : tot * wsc[row];
+        if (lane == 0) ctx[(s * p.H + h) * p.V + v] = (p.fmt == 5 || p.fmt == 4) ? tot : tot * wsc[row];
     }
 }
