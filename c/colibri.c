@@ -307,6 +307,10 @@ static inline int vk_reg_served(int layer,int eid){
 }
 static int g_vk_dense;        /* COLI_VK_DENSE=1: run the resident dense matmuls (attention
                                * projections + shared expert) on Vulkan too */
+/* PROF anatomy of the VK expert block (master-thread accumulated in moe(), printed by
+ * profile_print): where a decode block's wall goes besides t_ecpu/t_ewait/t_egpu. */
+static double g_vkb_cls, g_vkb_issue, g_vkb_acc;
+static int64_t g_vkb_blocks, g_vkb_nvk, g_vkb_ncpu;
 static int g_vk_attn;         /* COLI_VK_ATTN=1: run the MLA absorb attention core on Vulkan
                                * (mirrors COLI_CUDA_ATTN; KV latent cache mirrored on-device) */
 #endif
@@ -3612,7 +3616,10 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                     ncpu++;
                 }
             }
+            if(g_prof){ g_vkb_cls+=now_s()-t0; g_vkb_blocks++; g_vkb_nvk+=nvk; g_vkb_ncpu+=ncpu; }
+            double t_iss0=now_s();
             int vk_issued = nvk>0 && coli_vk_expert_group_issue(vg,vu,vd,vrows,nvk,vk_xh);
+            if(g_prof) g_vkb_issue+=now_s()-t_iss0;
             /* CPU share stays SERIAL over experts with row-parallel kernels: a decode
              * block leaves only ~5-6 CPU experts (the tier absorbs the hot head), fewer
              * than the OMP pool, so one-task-per-expert ran each expert single-threaded
@@ -3666,6 +3673,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                 }
             }
             double dt=now_s()-t0; m->t_emm+=dt;
+            if(g_prof) g_vkb_acc+=now_s()-t_take0;   /* take-wait (t_egpu) + result accumulate */
         }
 #endif
         if(!metal_done && !xexp_done && !vk_active)
@@ -5209,6 +5217,12 @@ static void profile_print(Model *m, double elapsed){
         (unsigned long long)m->cpu_expert_rows,m->t_egpu,m->t_route,m->t_p2p,(unsigned long long)m->n_p2p,
         elapsed-m->t_ewait-m->t_emm-m->t_attn-m->t_head-m->t_route-m->t_p2p>0?
         elapsed-m->t_ewait-m->t_emm-m->t_attn-m->t_head-m->t_route-m->t_p2p:0);
+#ifdef COLI_VULKAN
+    if(g_prof && g_vkb_blocks)
+        printf("VK-BLOCK: %lld blocks | avg nvk %.2f / ncpu %.2f | classify %.3fs | issue %.3fs | take+acc %.3fs (take-wait %.3fs) | cpu exec %.3fs wait %.3fs\n",
+            (long long)g_vkb_blocks,(double)g_vkb_nvk/g_vkb_blocks,(double)g_vkb_ncpu/g_vkb_blocks,
+            g_vkb_cls,g_vkb_issue,g_vkb_acc,m->t_egpu,m->t_ecpu,m->t_ewait);
+#endif
     if(g_mirror){
         double b0=atomic_load_explicit(&g_mir_bytes[0],memory_order_relaxed)/1e9;
         double b1=atomic_load_explicit(&g_mir_bytes[1],memory_order_relaxed)/1e9;
@@ -5234,6 +5248,9 @@ static void profile_reset(Model *m){
     m->t_ewait=m->t_emm=m->t_attn=m->t_kvb=m->t_head=0;
     m->t_ecpu=m->t_egpu=m->t_route=m->t_p2p=0;m->n_p2p=0;
     m->cpu_expert_bytes=0;m->cpu_expert_rows=0;
+#ifdef COLI_VULKAN
+    g_vkb_cls=g_vkb_issue=g_vkb_acc=0; g_vkb_blocks=g_vkb_nvk=g_vkb_ncpu=0;
+#endif
     m->t_aproj=m->t_acore=m->t_aout=0;
     atomic_store_explicit(&g_edisk_ns,0,memory_order_relaxed);
 }
