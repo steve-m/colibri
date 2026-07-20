@@ -490,10 +490,16 @@ int coli_vk_matmul(ColiVkTensor **tensor, float *y, const float *x,
                    int fmt, int S, int I, int O) {
     if (!G.ready || S < 1 || !upload_tensor(tensor, weights, scales, fmt, I, O)) return 0;
     ColiVkTensor *t = *tensor;
+    /* VK_PROF=1: phase split of the dense per-call cost, printed every 8192 calls —
+     * separates our code (memcpy/desc/record) from the driver (submit) and the GPU
+     * (fence wait) to localize the tier-size-linear tax. */
+    static double p_x, p_desc, p_rec, p_sub, p_wait, p_y; static long p_n;
+    double t0 = G.eg_prof ? vk_now() : 0, tA;
     size_t xb = (size_t)S * I * sizeof(float), yb = (size_t)S * O * sizeof(float);
     VkBuffer old_x = G.x.buf, old_y = G.y.buf;
     if (!scratch_reserve(&G.x, xb) || !scratch_reserve_mt(&G.y, yb, G.memtype_cached)) return 0;  /* y read back */
     memcpy(G.x.ptr, x, xb);
+    if (G.eg_prof) { tA = vk_now(); p_x += tA - t0; t0 = tA; }
 
     /* Rebind descriptors only when the tensor or a scratch buffer changed (a realloc
      * makes the old VkBuffer handle stale); otherwise the previous binding is still valid. */
@@ -513,6 +519,7 @@ int coli_vk_matmul(ColiVkTensor **tensor, float *y, const float *x,
         vkUpdateDescriptorSets(G.dev, 4, w, 0, NULL);
         G.bound_tensor = t; G.bound_xbuf = G.x.buf; G.bound_ybuf = G.y.buf;
     }
+    if (G.eg_prof) { tA = vk_now(); p_desc += tA - t0; t0 = tA; }
 
     /* Re-record the command buffer only when the binding or the dispatch shape changed.
      * Recorded WITHOUT one-time-submit so the same buffer can be resubmitted verbatim —
@@ -531,11 +538,13 @@ int coli_vk_matmul(ColiVkTensor **tensor, float *y, const float *x,
         VKCHECK(vkEndCommandBuffer(G.cmd), "endCmd");
         G.cmd_ready = 1; G.bound_S = S; G.bound_I = I; G.bound_O = O;
     }
+    if (G.eg_prof) { tA = vk_now(); p_rec += tA - t0; t0 = tA; }
 
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
         .commandBufferCount = 1, .pCommandBuffers = &G.cmd};
     VKCHECK(vkResetFences(G.dev, 1, &G.fence), "resetFence");
     VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.fence), "queueSubmit");
+    if (G.eg_prof) { tA = vk_now(); p_sub += tA - t0; t0 = tA; }
     // Bounded wait: a GPU hang/TDR must never wedge the process. 10s is orders of
     // magnitude over a single-GEMV dispatch; on timeout/device-loss disable VK for
     // the rest of the run and fall back to CPU (the caller degrades on our 0 return).
@@ -545,7 +554,14 @@ int coli_vk_matmul(ColiVkTensor **tensor, float *y, const float *x,
         G.ready = 0;
         return 0;
     }
+    if (G.eg_prof) { tA = vk_now(); p_wait += tA - t0; t0 = tA; }
     memcpy(y, G.y.ptr, yb);
+    if (G.eg_prof) {
+        p_y += vk_now() - t0;
+        if ((++p_n & 8191) == 0)
+            fprintf(stderr, "[VK_PROF dense] n=%ld | memcpy_x %.0f | desc %.0f | record %.0f | submit %.0f | wait %.0f | memcpy_y %.0f ms\n",
+                    p_n, p_x, p_desc, p_rec, p_sub, p_wait, p_y);
+    }
     return 1;
 }
 
