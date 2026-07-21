@@ -1411,17 +1411,20 @@ static void *map_of_fd(int fd){
     return base;
 }
 
-/* ==================== DUAL-SSD: two model copies, two drives ====================
- * COLI_MODEL_MIRROR=<dir> registers a SECOND (read-only) copy of the model on
- * another drive; expert reads are split between the two according to
- * COLI_DISK_WEIGHTS=<primary>,<mirror> (relative bandwidth; without the env it
- * is measured at startup with the engine's own access pattern). Cold decode is
- * disk-bound (~11 GB/token): two NVMe drives reading in parallel add up. */
-static const char *g_mirror_dir=NULL;  /* COLI_MODEL_MIRROR / SNAP_MIRROR */
+/* ==================== MULTI-SSD: N model copies, N drives ====================
+ * COLI_MODEL_MIRROR=<dir>[;<dir>...] registers additional read-only copies of
+ * the model on other drives; expert reads split across all copies according to
+ * COLI_DISK_WEIGHTS=<primary>,<mirror>[,<mirror2>...] (relative bandwidth;
+ * without the env it is measured at startup with the engine's own access
+ * pattern). Cold decode is disk-bound (~11 GB/token): N NVMe drives reading in
+ * parallel add up. */
+#define MIR_REPS (1+ST_MAX_MIR)        /* replicas incl. the primary */
+static const char *g_mirror_dir=NULL;  /* COLI_MODEL_MIRROR / SNAP_MIRROR (dir list) */
 static int g_mirror=0;                 /* 1 = mirror active (at least one shard accepted) */
-static int g_mir_share=64;             /* expert share routed to the mirror, out of 256 */
-static _Atomic int64_t g_mir_bytes[2]; /* bytes served per drive: [0] primary, [1] mirror */
-static _Atomic int64_t g_mir_nread[2];
+static int g_mir_nrep=1;               /* replicas incl. the primary */
+static int g_mir_cut[MIR_REPS]={256};  /* cumulative hash cuts of 256: replica r serves h in [cut[r-1],cut[r]) */
+static _Atomic int64_t g_mir_bytes[MIR_REPS]; /* bytes served per drive: [0] primary, [r] mirror r */
+static _Atomic int64_t g_mir_nread[MIR_REPS];
 
 /* replica of one expert: DETERMINISTIC hash of (layer,eid). Determinism is a
  * requirement, not a style choice: the readahead/PILOT WILLNEED and the demand
@@ -1431,7 +1434,9 @@ static inline int expert_route(int layer,int eid){
     if(!g_mirror) return 0;
     uint32_t h=(uint32_t)layer*2654435761u ^ (uint32_t)eid*0x9E3779B9u;
     h^=h>>16; h*=0x45d9f3bu; h^=h>>16;
-    return (int)(h&255) < g_mir_share;
+    int hv=(int)(h&255), r=0;
+    while(hv>=g_mir_cut[r]) r++;       /* cut[nrep-1]==256 terminates the scan */
+    return r;
 }
 
 /* buffered fd of the replica, falling back to the primary if the file is not mirrored */
@@ -1448,7 +1453,7 @@ static int pread_full(int fd, void *buf, int64_t n, int64_t off, const char *tag
  * Accounts bytes per drive. Returns 0 = ok, -1 = real error/EOF (like pread_full). */
 static ssize_t mir_pread(shards *S,int fd,int rep,void *buf,int64_t n,int64_t off,const char *tag){
     int rfd = st_fd_rep(S,fd,rep);
-    int used = rep && rfd>=0;
+    int used = (rep && rfd>=0) ? rep : 0;
     if(rfd<0) rfd=fd;
     int rc=pread_full(rfd,buf,n,off,tag);
     if(rc && used){
@@ -1569,7 +1574,7 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
                                 __atomic_add_fetch(&m->bytes_main,(uint64_t)tb,__ATOMIC_RELAXED); }
     }
     int rep=expert_route(layer,eid);             /* DUAL-SSD: this expert's replica */
-    if(rep && st_fd_rep(&m->S,tw[0]->fd,1)<0) rep=0;   /* shard not in the mirror (partial) */
+    if(rep && st_fd_rep(&m->S,tw[0]->fd,rep)<0) rep=0; /* shard not in that mirror (partial) */
     if(g_mmap){
         void *bw[3],*bq[3]; int okm=1;
         for(int k=0;k<3;k++){
@@ -5255,12 +5260,14 @@ static void profile_print(Model *m, double elapsed){
             g_vkb_cls,g_vkb_issue,g_vkb_acc,m->t_egpu,m->t_ecpu,m->t_ewait);
 #endif
     if(g_mirror){
-        double b0=atomic_load_explicit(&g_mir_bytes[0],memory_order_relaxed)/1e9;
-        double b1=atomic_load_explicit(&g_mir_bytes[1],memory_order_relaxed)/1e9;
-        printf("MIRROR: primary %.2f GB (%lld reads) | mirror %.2f GB (%lld reads) — %.0f%% of expert bytes from the mirror\n",
-            b0,(long long)atomic_load_explicit(&g_mir_nread[0],memory_order_relaxed),
-            b1,(long long)atomic_load_explicit(&g_mir_nread[1],memory_order_relaxed),
-            b0+b1>0?100.0*b1/(b0+b1):0.0);
+        double br[MIR_REPS]={0}, bt=0;
+        for(int r=0;r<g_mir_nrep;r++){ br[r]=atomic_load_explicit(&g_mir_bytes[r],memory_order_relaxed)/1e9; bt+=br[r]; }
+        printf("MIRROR: primary %.2f GB (%lld reads)",
+            br[0],(long long)atomic_load_explicit(&g_mir_nread[0],memory_order_relaxed));
+        for(int r=1;r<g_mir_nrep;r++)
+            printf(" | mirror%d %.2f GB (%lld reads)",
+                r,br[r],(long long)atomic_load_explicit(&g_mir_nread[r],memory_order_relaxed));
+        printf(" — %.0f%% of expert bytes from the mirrors\n", bt>0?100.0*(bt-br[0])/bt:0.0);
     }
 #ifdef COLI_METAL
     if(g_metal_enabled){ uint64_t ok=0,fb=0,ex=0; double su=0,gp=0,sc=0;
@@ -5408,8 +5415,7 @@ static void run_replay(Model *m, const int *full, int nfull, int np){
     m->hits=m->miss=m->ereq=m->gpu_expert_calls=0; m->hit_pin=m->hit_ecache=0; m->hit_vk=0;
     profile_reset(m);
     ProfBase pb; prof_base(m,&pb);
-    atomic_store(&g_mir_bytes[0],0); atomic_store(&g_mir_bytes[1],0);
-    atomic_store(&g_mir_nread[0],0); atomic_store(&g_mir_nread[1],0);
+    for(int r=0;r<MIR_REPS;r++){ atomic_store(&g_mir_bytes[r],0); atomic_store(&g_mir_nread[r],0); }
     double t0=now_s(); int steps=0;
     for(int i=np-1;i<nfull-1;i++){
         double tf0=g_prof?now_s():0;
@@ -6522,16 +6528,16 @@ static void pin_wire(Model *m){
 static double mirror_probe_bw(shards *S,int rep){
     int big=-1; int64_t bsz=0;
     for(int i=0;i<S->nfd;i++){
-        if(rep && S->mfds[i]<0) continue;
-        int64_t sz=lseek(rep?S->mfds[i]:S->fds[i],0,SEEK_END);
+        if(rep && S->mfds[rep-1][i]<0) continue;
+        int64_t sz=lseek(rep?S->mfds[rep-1][i]:S->fds[i],0,SEEK_END);
         if(sz>bsz){ bsz=sz; big=i; }
     }
     const int64_t blk=19ll<<20; const int NB=8;
     if(big<0 || bsz<blk*(NB+1)) return 0;
-    int dfd = rep? S->mdfds[big] : S->dfds[big];
-    int fd  = dfd>=0? dfd : (rep? S->mfds[big] : S->fds[big]);
-    if(dfd<0) fprintf(stderr,"[MIRROR] no O_DIRECT on %s: the probe may read the page cache — "
-                             "set COLI_DISK_WEIGHTS for an accurate split\n", rep?"the mirror":"the primary");
+    int dfd = rep? S->mdfds[rep-1][big] : S->dfds[big];
+    int fd  = dfd>=0? dfd : (rep? S->mfds[rep-1][big] : S->fds[big]);
+    if(dfd<0) fprintf(stderr,"[MIRROR] no O_DIRECT on replica %d: the probe may read the page cache — "
+                             "set COLI_DISK_WEIGHTS for an accurate split\n", rep);
     double t0=now_s(); int64_t tot=0;
     #pragma omp parallel for schedule(dynamic,1) reduction(+:tot)
     for(int i=0;i<NB;i++){
@@ -6547,37 +6553,82 @@ static double mirror_probe_bw(shards *S,int rep){
     return (dt>0 && tot>0)? tot/1e9/dt : 0;
 }
 
-/* DUAL-SSD setup: register the mirror copy, derive the read split from
- * COLI_DISK_WEIGHTS=<primary>,<mirror> or from a startup bandwidth probe.
- * Runs after model_init (needs the shard index) and BEFORE any pin/autopin
- * load, so the OMP-parallel pin warmup already streams from both drives. */
+/* MULTI-SSD setup: register every mirror copy listed in COLI_MODEL_MIRROR
+ * (';' or ',' separated dirs), derive the read split from
+ * COLI_DISK_WEIGHTS=<primary>,<mirror>[,<mirror2>...] or from a startup
+ * bandwidth probe. Runs after model_init (needs the shard index) and BEFORE
+ * any pin/autopin load, so the OMP-parallel pin warmup streams from all drives. */
 static void mirror_setup(Model *m){
     if(!g_mirror_dir) return;
-    const char *snap=getenv("SNAP");
-    if(snap && !strcmp(snap,g_mirror_dir)){
-        fprintf(stderr,"[MIRROR] mirror dir equals the model dir — ignored\n"); return;
+    const char *snap=getenv("SNAP"); if(!snap||!*snap) snap=getenv("COLI_MODEL");
+    st_mirror_reset(&m->S);
+    int nrep=1;
+    {   char buf[4096]; snprintf(buf,sizeof(buf),"%s",g_mirror_dir);
+        char *p=buf;
+        while(p && *p){
+            char *sep=p; while(*sep && *sep!=';' && *sep!=',') sep++;
+            int last=(*sep==0); *sep=0;
+            while(*p==' ') p++;
+            size_t plen=strlen(p); while(plen>0 && p[plen-1]==' ') p[--plen]=0;
+            if(*p){
+                if(snap && !strcmp(snap,p))
+                    fprintf(stderr,"[MIRROR] %s equals the model dir — ignored\n",p);
+                else if(nrep>=MIR_REPS)
+                    fprintf(stderr,"[MIRROR] %s: too many mirrors (max %d) — ignored\n",p,ST_MAX_MIR);
+                else {
+                    int nf=st_mirror_add(&m->S,p);
+                    if(nf<=0)
+                        fprintf(stderr,"[MIRROR] %s: no usable shard (missing or divergent copy) — skipped\n",p);
+                    else {
+                        fprintf(stderr,"[MIRROR] %s: %d/%d shards (replica %d)\n",p,nf,m->S.nfd,nrep);
+                        nrep++;
+                    }
+                }
+            }
+            p=last?NULL:sep+1;
+        }
     }
-    int nf=st_mirror_init(&m->S,g_mirror_dir);
-    if(nf<=0){
-        fprintf(stderr,"[MIRROR] %s: no usable shard (missing or divergent copy) — "
-                       "running on the primary drive only\n",g_mirror_dir);
+    if(nrep<2){
+        fprintf(stderr,"[MIRROR] no usable mirror — running on the primary drive only\n");
         return;
     }
-    g_mirror=1;
-    double wp=0,wm=0; const char *w=getenv("COLI_DISK_WEIGHTS"); const char *how="COLI_DISK_WEIGHTS";
-    if(w && (sscanf(w," %lf , %lf",&wp,&wm)!=2 || wp<=0 || wm<=0)){
-        fprintf(stderr,"[MIRROR] invalid COLI_DISK_WEIGHTS '%s' (want e.g. 9,3) — probing instead\n",w);
-        wp=wm=0;
+    g_mirror=1; g_mir_nrep=nrep;
+    double wt[MIR_REPS]; int have=0;
+    const char *w=getenv("COLI_DISK_WEIGHTS"); const char *how="COLI_DISK_WEIGHTS";
+    if(w && *w){
+        char wb[256]; snprintf(wb,sizeof(wb),"%s",w); int wn=0, bad=0;
+        for(char *tok=strtok(wb,", "); tok; tok=strtok(NULL,", ")){
+            double v=atof(tok);
+            if(v<=0 || wn>=MIR_REPS){ bad=1; break; }
+            wt[wn++]=v;
+        }
+        if(!bad && wn==nrep) have=1;
+        else fprintf(stderr,"[MIRROR] invalid COLI_DISK_WEIGHTS '%s' (want %d positive comma-separated "
+                            "weights, e.g. 9,3) — probing instead\n",w,nrep);
     }
-    if(wp<=0||wm<=0){
-        wp=mirror_probe_bw(&m->S,0); wm=mirror_probe_bw(&m->S,1); how="measured";
-        if(wp>0&&wm>0) fprintf(stderr,"[MIRROR] probe: primary %.2f GB/s, mirror %.2f GB/s\n",wp,wm);
-        else { wp=wm=1; how="fallback 1:1 (probe failed)"; }
+    if(!have){
+        have=1; how="measured";
+        for(int r=0;r<nrep;r++){ wt[r]=mirror_probe_bw(&m->S,r); if(wt[r]<=0) have=0; }
+        if(have){
+            fprintf(stderr,"[MIRROR] probe:");
+            for(int r=0;r<nrep;r++) fprintf(stderr,"%s %s %.2f GB/s",r?" |":"",r?"mirror":"primary",wt[r]);
+            fprintf(stderr,"\n");
+        } else { for(int r=0;r<nrep;r++) wt[r]=1; how="fallback 1:1 (probe failed)"; }
     }
-    int share=(int)(256.0*wm/(wp+wm)+0.5);
-    g_mir_share = share<1?1 : share>255?255 : share;
-    fprintf(stderr,"[MIRROR] %s: %d/%d shards | read split primary %.0f%% / mirror %.0f%% (%s)\n",
-        g_mirror_dir,nf,m->S.nfd,100.0*(256-g_mir_share)/256,100.0*g_mir_share/256,how);
+    double W=0; for(int r=0;r<nrep;r++) W+=wt[r];
+    int acc=0; double cum=0;
+    for(int r=0;r<nrep;r++){
+        cum+=wt[r];
+        int c=(int)(256.0*cum/W+0.5);
+        if(c<=acc) c=acc+1;            /* every replica keeps a non-empty slice */
+        if(c>256) c=256;
+        g_mir_cut[r]=c; acc=c;
+    }
+    g_mir_cut[nrep-1]=256;             /* the last replica absorbs rounding */
+    fprintf(stderr,"[MIRROR] %d drives | read split",nrep);
+    for(int r=0;r<nrep;r++){ int lo=r?g_mir_cut[r-1]:0;
+        fprintf(stderr,"%s %.0f%%",r?" /":"",100.0*(g_mir_cut[r]-lo)/256); }
+    fprintf(stderr," (%s)\n",how);
 }
 
 typedef struct { int l,e; uint32_t c; } PinRec;
