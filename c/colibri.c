@@ -2995,6 +2995,20 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
  * una volta sola e moltiplicato per tutte le posizioni che lo usano (pesi letti 1 volta);
  * lo shared expert e' un unico matmul a S righe. Per posizione l'accumulo resta
  * nell'ordine (routed nel loro ordine di union, poi shared). */
+#ifdef COLI_VULKAN
+/* dev2 group issue on a worker thread: the Polaris/x4 submit path costs ~0.8ms per
+ * dev2-active block serialized on the main thread (measured 3.2s/decode vs 0.15s
+ * dev0-only) while the 580's exec itself finishes early (take-wait 0.1s) — off-thread
+ * it overlaps dev0's issue + the CPU expert share. All Vulkan state it touches is
+ * G2-private, and moe() joins before take2, preserving the one-in-flight invariant. */
+typedef struct { ColiVkTensor **g,**u,**d; const int *rows; int n; const float *x; int rc; } Vk2Iss;
+static void *vk2_issue_worker(void *p){
+    Vk2Iss *j=(Vk2Iss*)p;
+    j->rc = coli_vk_expert_group_issue2(j->g,j->u,j->d,j->rows,j->n,j->x);
+    return NULL;
+}
+#endif
+
 /* pin ∪ LRU residency probe (used by CACHE_ROUTE max-rank fill). */
 static int expert_is_resident(Model *m, int layer, int eid){
     ESlot *P=m->pin[layer];
@@ -3723,8 +3737,15 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             }
             if(g_prof){ g_vkb_cls+=now_s()-t0; g_vkb_blocks++; g_vkb_nvk+=nvk+nvk2; g_vkb_nvk2+=nvk2; g_vkb_ncpu+=ncpu; }
             double t_iss0=now_s();
-            /* issue the SLOWER device first so it gets the longest overlap window */
-            int vk2_issued = nvk2>0 && coli_vk_expert_group_issue2(vg2,vu2,vd2,vrows2,nvk2,vk_xh2);
+            /* issue the SLOWER device first so it gets the longest overlap window;
+             * dev2's submit runs on a worker thread (joined before take2 below) so its
+             * per-block cost overlaps dev0 issue + the CPU share instead of serializing */
+            Vk2Iss iss2 = { vg2, vu2, vd2, vrows2, nvk2, vk_xh2, 0 };
+            pthread_t iss2_th; int iss2_threaded=0;
+            if(nvk2>0){
+                if(pthread_create(&iss2_th,NULL,vk2_issue_worker,&iss2)==0) iss2_threaded=1;
+                else iss2.rc = coli_vk_expert_group_issue2(vg2,vu2,vd2,vrows2,nvk2,vk_xh2);
+            }
             int vk_issued = nvk>0 && coli_vk_expert_group_issue(vg,vu,vd,vrows,nvk,vk_xh);
             if(g_prof) g_vkb_issue+=now_s()-t_iss0;
             /* CPU share stays SERIAL over experts with row-parallel kernels: a decode
@@ -3781,7 +3802,8 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             }
             /* dev2 group: taken AFTER dev0's accumulate so the slower card gets the
              * extra overlap; same per-expert CPU recompute fallback on failure. */
-            int vk2_ok = vk2_issued && coli_vk_expert_group_take2(vk_yh2);
+            if(iss2_threaded) pthread_join(iss2_th,NULL);
+            int vk2_ok = iss2.rc && coli_vk_expert_group_take2(vk_yh2);
             for(int c2=0;c2<nvk2;c2++){ int nr=vrows2[c2];
                 if(vk2_ok){ int o=voff2[c2];
                     for(int r=0;r<nr;r++){ float *os=out+(int64_t)vrmap2[c2*S+r]*D, wgt=vwmap2[c2*S+r], *src=vk_yh2+(int64_t)(o+r)*D;
