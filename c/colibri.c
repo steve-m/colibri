@@ -6356,6 +6356,37 @@ static int vk_cand_cmp(const void *a, const void *b){
     uint32_t ua=((const VkCand*)a)->u, ub=((const VkCand*)b)->u;
     return ua<ub ? 1 : ua>ub ? -1 : 0;
 }
+/* Upload the VK dense working set (attention projections, absorb kv_b, o-proj,
+ * shared expert) at startup, BEFORE the tier fill. These ~8 GB otherwise
+ * allocate lazily on the first forwards — AFTER the tier has filled to its
+ * budget — and on a 16 GB card the late arrivals overflow to GTT (measured
+ * 2.1 GB spilled with a 320-expert int4 tier; every per-token attention
+ * submit then pays PCIe latency: absorb 1.69 → 2.26 ms/call, +34%). Claiming
+ * the dense set first lets the budget-capped tier fill see the true remainder
+ * and self-size to what actually fits in device memory. */
+static void vk_dense_preload(Model *m){
+    Cfg *c=&m->c;
+    if(!g_vulkan || !g_vk_dense) return;
+    double t0=now_s(); int64_t bytes=0; int nt=0, full=0;
+    for(int i=0;i<=c->n_layers && !full;i++){
+        Layer *l = i<c->n_layers ? &m->L[i] : &m->mtpL;
+        QT *ts[]={&l->q_a,&l->q_b,&l->kv_a,&l->kv_b,&l->o,&l->sh_gate,&l->sh_up,&l->sh_down};
+        for(size_t k=0;k<sizeof(ts)/sizeof(ts[0]);k++){
+            QT *t=ts[k];
+            if(t->vk || !VK_FMT_OK(t) || t->I<=0 || t->O<=0) continue;
+            const void *w = t->fmt==1 ? (const void*)t->q8 : (const void*)t->q4;
+            if(!w || !t->s) continue;
+            if(!coli_vk_tensor_ensure(&t->vk,w,t->s,t->fmt,t->I,t->O,t->gs)){
+                fprintf(stderr,"[VK] dense preload: VRAM full at layer %d — remaining tensors stay lazy\n",i);
+                full=1; break;
+            }
+            bytes+=coli_vk_tensor_bytes(t->vk); nt++;
+        }
+    }
+    if(nt) fprintf(stderr,"[VK] dense preloaded: %d tensors, %.2f GB VRAM in %.1fs\n",
+                   nt,bytes/1e9,now_s()-t0);
+}
+
 static void vk_registry_fill(Model *m){
     Cfg *c=&m->c; int E=c->n_experts, NL=c->n_layers;
     if(!g_vulkan || g_vk_budget<=0) return;
@@ -7439,6 +7470,7 @@ int main(int argc, char **argv){
       g_prof = getenv("PROF")?atoi(getenv("PROF")):0;   /* PROF=1: opt-in performance profile */
       if(g_prof) prof_config(&m, ram_env, est_ctx); }
 #ifdef COLI_VULKAN
+    vk_dense_preload(&m);   /* dense claims VRAM first — the tier fill sizes to the remainder */
     vk_registry_fill(&m);   /* pinned VK expert tier: needs the usage history loaded above */
 #endif
     const char *stats=getenv("STATS");   /* STATS=<file> -> istogramma uso expert a fine run */
