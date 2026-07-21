@@ -514,6 +514,29 @@ int coli_vk_tensor_ensure(ColiVkTensor **tensor, const void *weights, const floa
     return upload_tensor(tensor, weights, scales, fmt, I, O, grp);
 }
 
+/* Sync-path fence wait. A blocked vkWaitForFences pays a scheduler wake on
+ * signal (~50-150 us) — and the engine fences ~2 sync submits per layer per
+ * token, so the wakes alone cost seconds per run. Spin on vkGetFenceStatus for
+ * a short budget first (the common decode dispatch completes in 0.5-2 ms),
+ * then fall back to the blocking wait. The spinning thread is stalled on the
+ * GPU result anyway. COLI_VK_SPIN_US=0 restores the pure blocking wait. */
+static long g_vk_spin_us = -1;
+static VkResult vk_fence_wait(VkFence f) {
+    if (g_vk_spin_us < 0) {
+        const char *e = getenv("COLI_VK_SPIN_US");
+        g_vk_spin_us = e ? atol(e) : 300;
+        if (g_vk_spin_us < 0) g_vk_spin_us = 0;
+    }
+    if (g_vk_spin_us > 0) {
+        double t0 = vk_now();
+        do {
+            VkResult r = vkGetFenceStatus(G.dev, f);
+            if (r != VK_NOT_READY) return r;   /* VK_SUCCESS or a real error */
+        } while ((vk_now() - t0) * 1000.0 < (double)g_vk_spin_us);
+    }
+    return vkWaitForFences(G.dev, 1, &f, VK_TRUE, 10000000000ULL);
+}
+
 /* Global submit/wait totals across EVERY synchronous GPU path (VK_PROF=1) — the
  * per-path counters miss traffic that flows through the fused pair/absorb/group
  * entries, so the tier-size-linear per-submit tax is localized here instead. */
@@ -586,7 +609,7 @@ int coli_vk_matmul(ColiVkTensor **tensor, float *y, const float *x,
     // Bounded wait: a GPU hang/TDR must never wedge the process. 10s is orders of
     // magnitude over a single-GEMV dispatch; on timeout/device-loss disable VK for
     // the rest of the run and fall back to CPU (the caller degrades on our 0 return).
-    VkResult wr = vkWaitForFences(G.dev, 1, &G.fence, VK_TRUE, 10000000000ULL);
+    VkResult wr = vk_fence_wait(G.fence);
     if (wr != VK_SUCCESS) {
         fprintf(stderr, "[VK] fence wait failed: %d — disabling GPU offload, staying on CPU\n", wr);
         G.ready = 0;
@@ -642,7 +665,7 @@ int coli_vk_gate_up(ColiVkTensor **gate, ColiVkTensor **up, float *hidden, const
     double vp0 = G.eg_prof ? vk_now() : 0;
     VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.fence), "queueSubmit");
     if (G.eg_prof) { double vp1 = vk_now(); g_vsub_ms += vp1 - vp0; vp0 = vp1; }
-    if (vkWaitForFences(G.dev, 1, &G.fence, VK_TRUE, 10000000000ULL) != VK_SUCCESS) { G.ready = 0; return 0; }
+    if (vk_fence_wait(G.fence) != VK_SUCCESS) { G.ready = 0; return 0; }
     if (G.eg_prof) { g_vwait_ms += vk_now() - vp0; vkprof_tick(); }
     memcpy(hidden, G.h.ptr, hb);
     G.cmd_ready = 0; G.bound_tensor = NULL;   /* the shared command buffer/binding was clobbered */
@@ -760,7 +783,7 @@ int coli_vk_expert_group_issue(ColiVkTensor *const *gates, ColiVkTensor *const *
 int coli_vk_expert_group_take(float *y) {
     if (!G.eg_inflight) return 0;
     G.eg_inflight = 0;
-    if (vkWaitForFences(G.dev, 1, &G.eg_fence, VK_TRUE, 10000000000ULL) != VK_SUCCESS) {
+    if (vk_fence_wait(G.eg_fence) != VK_SUCCESS) {
         fprintf(stderr, "[VK] expert-group fence wait failed — disabling GPU offload\n");
         G.ready = 0; return 0;
     }
@@ -877,7 +900,7 @@ int coli_vk_attention_absorb(ColiVkTensor **kvb, const void *w, const float *sc,
     double vp0 = G.eg_prof ? vk_now() : 0;
     VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.fence), "queueSubmit");
     if (G.eg_prof) { double vp1 = vk_now(); g_vsub_ms += vp1 - vp0; vp0 = vp1; }
-    if (vkWaitForFences(G.dev, 1, &G.fence, VK_TRUE, 10000000000ULL) != VK_SUCCESS) { G.ready = 0; return 0; }
+    if (vk_fence_wait(G.fence) != VK_SUCCESS) { G.ready = 0; return 0; }
     if (G.eg_prof) { g_vwait_ms += vk_now() - vp0; vkprof_tick(); }
     memcpy(ctx, G.y.ptr, cb);
     G.cmd_ready = 0; G.bound_tensor = NULL;   /* the shared command buffer/binding was clobbered */
@@ -936,7 +959,7 @@ int coli_vk_matmul_pair(ColiVkTensor **t1p, float *y1, const void *w1, const flo
     double vp0 = G.eg_prof ? vk_now() : 0;
     VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.fence), "queueSubmit");
     if (G.eg_prof) { double vp1 = vk_now(); g_vsub_ms += vp1 - vp0; vp0 = vp1; }
-    if (vkWaitForFences(G.dev, 1, &G.fence, VK_TRUE, 10000000000ULL) != VK_SUCCESS) { G.ready = 0; return 0; }
+    if (vk_fence_wait(G.fence) != VK_SUCCESS) { G.ready = 0; return 0; }
     if (G.eg_prof) { g_vwait_ms += vk_now() - vp0; vkprof_tick(); }
     memcpy(y1, G.y.ptr, yb1);
     memcpy(y2, G.y2.ptr, yb2);
@@ -1037,7 +1060,7 @@ int coli_vk_attn_qprep(int layer,
     double vp0 = G.eg_prof ? vk_now() : 0;
     VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.fence), "queueSubmit");
     if (G.eg_prof) { double vp1 = vk_now(); g_vsub_ms += vp1 - vp0; vp0 = vp1; }
-    if (vkWaitForFences(G.dev, 1, &G.fence, VK_TRUE, 10000000000ULL) != VK_SUCCESS) { G.ready = 0; return 0; }
+    if (vk_fence_wait(G.fence) != VK_SUCCESS) { G.ready = 0; return 0; }
     if (G.eg_prof) { g_vwait_ms += vk_now() - vp0; vkprof_tick(); }
     memcpy(q_out, G.y.ptr, qb_b);
     memcpy(kv_out, G.y2.ptr, kvb_b);
@@ -1110,7 +1133,7 @@ int coli_vk_attention_absorb_project(ColiVkTensor **kvb, const void *w, const fl
     double vp0 = G.eg_prof ? vk_now() : 0;
     VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.fence), "queueSubmit");
     if (G.eg_prof) { double vp1 = vk_now(); g_vsub_ms += vp1 - vp0; vp0 = vp1; }
-    if (vkWaitForFences(G.dev, 1, &G.fence, VK_TRUE, 10000000000ULL) != VK_SUCCESS) { G.ready = 0; return 0; }
+    if (vk_fence_wait(G.fence) != VK_SUCCESS) { G.ready = 0; return 0; }
     if (G.eg_prof) { g_vwait_ms += vk_now() - vp0; vkprof_tick(); }
     memcpy(out, G.y.ptr, ob);
     G.cmd_ready = 0; G.bound_tensor = NULL;   /* the shared command buffer/binding was clobbered */
