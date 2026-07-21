@@ -1444,6 +1444,54 @@ static inline int rep_bfd(shards *S,int fd,int rep){
     int r=st_fd_rep(S,fd,rep); return r<0?fd:r;
 }
 
+/* MULTI-SSD striped demand read (COLI_MIR_STRIPE=0 disables): split the one
+ * coalesced O_DIRECT expert pread into disjoint 4K-aligned chunks, one per
+ * replica that holds the shard, read in parallel. A cold ~19 MB expert read is
+ * single-thread latency-bound (~4 GB/s on one NVMe) and it is the felt wait of
+ * every demand miss; N drives reading stripes of the SAME expert cut it ~N-fold.
+ * O_DIRECT only: no page cache involved, so striping cannot double-cache an
+ * expert across drives (the buffered path keeps whole-expert replica routing).
+ * Chunk 0 starts on the ROUTED replica so the hash still spreads first-chunk
+ * load evenly. Any short stripe fails the whole attempt (caller falls back to
+ * the single-replica read). */
+static int g_mir_stripe=1;
+typedef struct { int fd; char *buf; int64_t len, off; ssize_t r; } MirStripe;
+static void *mir_stripe_worker(void *a){
+    MirStripe *st=(MirStripe*)a;
+    st->r = pread(st->fd, st->buf, (size_t)st->len, st->off);
+    return NULL;
+}
+/* Returns total bytes read (== len) on success, -1 to make the caller fall back. */
+static int64_t mir_pread_striped(shards *S,int fd,int rep,char *buf,int64_t len,int64_t base){
+    if(!g_mir_stripe || g_mir_nrep<2 || len < (4<<20)) return -1;
+    int sfd[MIR_REPS], srep[MIR_REPS], nsf=0;
+    for(int r=0;r<g_mir_nrep && r<MIR_REPS;r++){
+        int f=st_direct_fd_rep(S,fd,r);
+        if(f>=0){ sfd[nsf]=f; srep[nsf]=r; nsf++; }
+    }
+    if(nsf<2) return -1;
+    int64_t chunk=((len+nsf-1)/nsf + 4095) & ~4095LL;
+    MirStripe st[MIR_REPS]; pthread_t th[MIR_REPS]; int nth=0, ns=0;
+    for(int i=0;i<nsf;i++){
+        int64_t o=(int64_t)i*chunk; if(o>=len) break;
+        int k=(rep+i)%nsf;                    /* chunk 0 on the routed replica */
+        st[ns]=(MirStripe){sfd[k], buf+o, len-o<chunk?len-o:chunk, base+o, -1};
+        ns++;
+    }
+    for(int i=1;i<ns;i++)
+        if(pthread_create(&th[nth],NULL,mir_stripe_worker,&st[i])==0) nth++;
+        else st[i].r=pread(st[i].fd,st[i].buf,(size_t)st[i].len,st[i].off);
+    st[0].r = pread(st[0].fd, st[0].buf, (size_t)st[0].len, st[0].off);
+    for(int i=0;i<nth;i++) pthread_join(th[i],NULL);
+    for(int i=0;i<ns;i++) if(st[i].r!=st[i].len) return -1;
+    for(int i=0;i<ns;i++){
+        int k=(rep+i)%nsf;
+        atomic_fetch_add_explicit(&g_mir_bytes[srep[k]],st[i].len,memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_mir_nread[srep[k]],1,memory_order_relaxed);
+    }
+    return len;
+}
+
 static int pread_full(int fd, void *buf, int64_t n, int64_t off, const char *tag);
 
 /* pread on the chosen replica with fallback to the primary on error/short-read:
@@ -1698,12 +1746,19 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
         if(dfd>=0){                              /* O_DIRECT: offset/len allineati a 4K */
             int64_t base=off0 & ~4095LL, need=(off0-base)+wtot;
             int64_t len=(need+4095)&~4095LL;
-            ssize_t r=pread(dfd, s->slab, len, base);
+            /* multi-SSD: stripe the read across the replicas (accounts internally);
+             * any failure falls back to the whole read on the routed replica */
+            ssize_t r=(ssize_t)mir_pread_striped(&m->S,tw[ord[0]]->fd,rep,(char*)s->slab,len,base);
+            if(r<need){
+                r=pread(dfd, s->slab, len, base);
+                if(r>=need){
+                    atomic_fetch_add_explicit(&g_mir_bytes[rep],(int64_t)r,memory_order_relaxed);
+                    atomic_fetch_add_explicit(&g_mir_nread[rep],1,memory_order_relaxed);
+                }
+            }
             if(r>=need){
                 pos[ord[0]]=off0-base; pos[ord[1]]=pos[ord[0]]+tw[ord[0]]->nbytes;
                 pos[ord[2]]=pos[ord[1]]+tw[ord[1]]->nbytes; done=1; dc_direct=1;
-                atomic_fetch_add_explicit(&g_mir_bytes[rep],(int64_t)r,memory_order_relaxed);
-                atomic_fetch_add_explicit(&g_mir_nread[rep],1,memory_order_relaxed);
             }
         }
         if(!done){                               /* fallback bufferizzato */
@@ -7243,7 +7298,8 @@ int main(int argc, char **argv){
         fprintf(stderr,"URING=1 is supported only on Linux\n"); return 2;
 #endif
     }
-    g_mirror_dir = getenv("COLI_MODEL_MIRROR");            /* DUAL-SSD: second model copy */
+    if(getenv("COLI_MIR_STRIPE")) g_mir_stripe=atoi(getenv("COLI_MIR_STRIPE"));
+    g_mirror_dir = getenv("COLI_MODEL_MIRROR");            /* MULTI-SSD: replica model copies */
     if(!g_mirror_dir||!*g_mirror_dir) g_mirror_dir = getenv("SNAP_MIRROR");
     if(g_mirror_dir&&!*g_mirror_dir) g_mirror_dir = NULL;
     g_idot = getenv("IDOT")?atoi(getenv("IDOT")):1;        /* 0 = kernel f32 esatti (A/B) */
