@@ -307,10 +307,12 @@ static inline int vk_reg_served(int layer,int eid){
 }
 static int g_vk_dense;        /* COLI_VK_DENSE=1: run the resident dense matmuls (attention
                                * projections + shared expert) on Vulkan too */
+static int g_vk_budget2;      /* COLI_VK_EXPERTS2: dev2 expert-tier cap (with COLI_VK_DEV2) */
+static int g_vk_reg_n2;       /* experts resident on the dev2 tier */
 /* PROF anatomy of the VK expert block (master-thread accumulated in moe(), printed by
  * profile_print): where a decode block's wall goes besides t_ecpu/t_ewait/t_egpu. */
 static double g_vkb_cls, g_vkb_issue, g_vkb_acc;
-static int64_t g_vkb_blocks, g_vkb_nvk, g_vkb_ncpu;
+static int64_t g_vkb_blocks, g_vkb_nvk, g_vkb_nvk2, g_vkb_ncpu;
 static int g_vk_attn;         /* COLI_VK_ATTN=1: run the MLA absorb attention core on Vulkan
                                * (mirrors COLI_CUDA_ATTN; KV latent cache mirrored on-device) */
 #endif
@@ -3383,10 +3385,13 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
 #endif
     int vk_active = 0; (void)vk_active;
 #ifdef COLI_VULKAN
-    vk_active = g_vulkan && g_vk_reg_n>0 && !omp_in_parallel() && S<=4;   /* empty registry (tier
-                                                * off / no usage history) = normal CPU expert loop */
+    vk_active = g_vulkan && (g_vk_reg_n+g_vk_reg_n2)>0 && !omp_in_parallel() && S<=4;   /* empty
+                                                * registry (tier off / no usage history) = normal CPU expert loop */
     float *vk_xh = vk_active?falloc((int64_t)S*K*D):NULL;
     float *vk_yh = vk_active?falloc((int64_t)S*K*D):NULL;
+    int vk2_on = vk_active && g_vk_reg_n2>0;    /* dev2 tier live: second async group */
+    float *vk_xh2 = vk2_on?falloc((int64_t)S*K*D):NULL;
+    float *vk_yh2 = vk2_on?falloc((int64_t)S*K*D):NULL;
 #endif
     int shared_on_gpu=0; (void)shared_on_gpu;   /* set by the Metal path when Phase E was fused */
     for(int base=0;base<nu;base+=64){
@@ -3688,8 +3693,9 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
              * waited, every use[] slot loaded before the end-of-block LRU swap); pass 4
              * takes the GPU results (fallback: recompute those rows on the CPU). */
             ColiVkTensor *vg[64],*vu[64],*vd[64]; int veid[64]; int vrows[64], voff[64], vrmap[64*4]; float vwmap[64*4];
+            ColiVkTensor *vg2[64],*vu2[64],*vd2[64]; int veid2[64]; int vrows2[64], voff2[64], vrmap2[64*4]; float vwmap2[64*4];
             ESlot *ce[64]; int cnr[64], crmap[64*4]; float cwmap[64*4]; int cqof[64];
-            int nvk=0, vtot=0, ncpu=0;
+            int nvk=0, vtot=0, nvk2=0, vtot2=0, ncpu=0;
             double t0=now_s();
             for(int j=0;j<nb;j++){ int eid=uniq[base+j];
                 int nr=0;
@@ -3698,18 +3704,27 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                 if(!nr){ if(g_pipe && qof[j]>=0){ double tw=now_s(); pipe_wait(qof[j]); m->t_ewait += now_s()-tw; } continue; }
                 if(vk_hit[j]){          /* registry-served: no RAM slot, no disk load */
                     ColiVkTensor **reg=vk_reg_at(layer,eid);
-                    voff[nvk]=vtot;
-                    for(int r=0;r<nr;r++){ memcpy(vk_xh+(int64_t)(vtot+r)*D, x+(int64_t)rows[r]*D, D*sizeof(float));
-                        vrmap[nvk*S+r]=rows[r]; vwmap[nvk*S+r]=rw[r]; }
-                    vg[nvk]=reg[0]; vu[nvk]=reg[1]; vd[nvk]=reg[2]; veid[nvk]=eid; vrows[nvk]=nr; vtot+=nr; nvk++;
+                    if(vk2_on && coli_vk_tensor_dev(reg[0])==1){   /* dev2 tier expert */
+                        voff2[nvk2]=vtot2;
+                        for(int r=0;r<nr;r++){ memcpy(vk_xh2+(int64_t)(vtot2+r)*D, x+(int64_t)rows[r]*D, D*sizeof(float));
+                            vrmap2[nvk2*S+r]=rows[r]; vwmap2[nvk2*S+r]=rw[r]; }
+                        vg2[nvk2]=reg[0]; vu2[nvk2]=reg[1]; vd2[nvk2]=reg[2]; veid2[nvk2]=eid; vrows2[nvk2]=nr; vtot2+=nr; nvk2++;
+                    } else {
+                        voff[nvk]=vtot;
+                        for(int r=0;r<nr;r++){ memcpy(vk_xh+(int64_t)(vtot+r)*D, x+(int64_t)rows[r]*D, D*sizeof(float));
+                            vrmap[nvk*S+r]=rows[r]; vwmap[nvk*S+r]=rw[r]; }
+                        vg[nvk]=reg[0]; vu[nvk]=reg[1]; vd[nvk]=reg[2]; veid[nvk]=eid; vrows[nvk]=nr; vtot+=nr; nvk++;
+                    }
                 } else {
                     ce[ncpu]=use[j]; cnr[ncpu]=nr; cqof[ncpu]=qof[j];
                     for(int r=0;r<nr;r++){ crmap[ncpu*S+r]=rows[r]; cwmap[ncpu*S+r]=rw[r]; }
                     ncpu++;
                 }
             }
-            if(g_prof){ g_vkb_cls+=now_s()-t0; g_vkb_blocks++; g_vkb_nvk+=nvk; g_vkb_ncpu+=ncpu; }
+            if(g_prof){ g_vkb_cls+=now_s()-t0; g_vkb_blocks++; g_vkb_nvk+=nvk+nvk2; g_vkb_nvk2+=nvk2; g_vkb_ncpu+=ncpu; }
             double t_iss0=now_s();
+            /* issue the SLOWER device first so it gets the longest overlap window */
+            int vk2_issued = nvk2>0 && coli_vk_expert_group_issue2(vg2,vu2,vd2,vrows2,nvk2,vk_xh2);
             int vk_issued = nvk>0 && coli_vk_expert_group_issue(vg,vu,vd,vrows,nvk,vk_xh);
             if(g_prof) g_vkb_issue+=now_s()-t_iss0;
             /* CPU share stays SERIAL over experts with row-parallel kernels: a decode
@@ -3761,6 +3776,24 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                     for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
                     matmul_qt(hh, gg, &e->d, nr);
                     for(int r=0;r<nr;r++){ float *os=out+(int64_t)vrmap[c2*S+r]*D, wgt=vwmap[c2*S+r], *hr=hh+(int64_t)r*D;
+                        for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
+                }
+            }
+            /* dev2 group: taken AFTER dev0's accumulate so the slower card gets the
+             * extra overlap; same per-expert CPU recompute fallback on failure. */
+            int vk2_ok = vk2_issued && coli_vk_expert_group_take2(vk_yh2);
+            for(int c2=0;c2<nvk2;c2++){ int nr=vrows2[c2];
+                if(vk2_ok){ int o=voff2[c2];
+                    for(int r=0;r<nr;r++){ float *os=out+(int64_t)vrmap2[c2*S+r]*D, wgt=vwmap2[c2*S+r], *src=vk_yh2+(int64_t)(o+r)*D;
+                        for(int d=0;d<D;d++) os[d]+=wgt*src[d]; }
+                } else {
+                    ESlot *e=&m->ws[nmiss<63?nmiss:63];
+                    if(e->eid!=veid2[c2] || !e->slab) expert_load(m,layer,veid2[c2],e,1,0);
+                    for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D, x+(int64_t)vrmap2[c2*S+r]*D, D*sizeof(float));
+                    expert_gate_up(gg,uu,xg,&e->g,&e->u,nr);
+                    for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
+                    matmul_qt(hh, gg, &e->d, nr);
+                    for(int r=0;r<nr;r++){ float *os=out+(int64_t)vrmap2[c2*S+r]*D, wgt=vwmap2[c2*S+r], *hr=hh+(int64_t)r*D;
                         for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
                 }
             }
@@ -5362,8 +5395,8 @@ static void profile_print(Model *m, double elapsed){
         elapsed-m->t_ewait-m->t_emm-m->t_attn-m->t_head-m->t_route-m->t_p2p:0);
 #ifdef COLI_VULKAN
     if(g_prof && g_vkb_blocks)
-        printf("VK-BLOCK: %lld blocks | avg nvk %.2f / ncpu %.2f | classify %.3fs | issue %.3fs | take+acc %.3fs (take-wait %.3fs) | cpu exec %.3fs wait %.3fs\n",
-            (long long)g_vkb_blocks,(double)g_vkb_nvk/g_vkb_blocks,(double)g_vkb_ncpu/g_vkb_blocks,
+        printf("VK-BLOCK: %lld blocks | avg nvk %.2f (dev2 %.2f) / ncpu %.2f | classify %.3fs | issue %.3fs | take+acc %.3fs (take-wait %.3fs) | cpu exec %.3fs wait %.3fs\n",
+            (long long)g_vkb_blocks,(double)g_vkb_nvk/g_vkb_blocks,(double)g_vkb_nvk2/g_vkb_blocks,(double)g_vkb_ncpu/g_vkb_blocks,
             g_vkb_cls,g_vkb_issue,g_vkb_acc,m->t_egpu,m->t_ecpu,m->t_ewait);
 #endif
     if(g_mirror){
@@ -5394,7 +5427,7 @@ static void profile_reset(Model *m){
     m->t_ecpu=m->t_egpu=m->t_route=m->t_p2p=0;m->n_p2p=0;
     m->cpu_expert_bytes=0;m->cpu_expert_rows=0;
 #ifdef COLI_VULKAN
-    g_vkb_cls=g_vkb_issue=g_vkb_acc=0; g_vkb_blocks=g_vkb_nvk=g_vkb_ncpu=0;
+    g_vkb_cls=g_vkb_issue=g_vkb_acc=0; g_vkb_blocks=g_vkb_nvk=g_vkb_nvk2=g_vkb_ncpu=0;
 #endif
     m->t_aproj=m->t_acore=m->t_aout=0;
     atomic_store_explicit(&g_edisk_ns,0,memory_order_relaxed);
@@ -6518,8 +6551,9 @@ static void vk_registry_fill(Model *m){
      * max_t). Without the budget extension the count cap alone applies, as before. */
     double vkr_reserve = getenv("COLI_VK_RESERVE_GB")?atof(getenv("COLI_VK_RESERVE_GB")):3.0;
     int vkr_stopped=0; double vkr_used=0, vkr_budget=0;
+    int64_t i2=0;
     coli_vk_alloc_priority(0.4f);
-    for(int64_t i2=0;i2<n && g_vk_reg_n<g_vk_budget;i2++){
+    for(;i2<n && g_vk_reg_n<g_vk_budget;i2++){
         if(vkr_reserve>0 && (g_vk_reg_n&7)==0 && coli_vk_mem_budget(&vkr_used,&vkr_budget)
            && vkr_budget-vkr_used < vkr_reserve){ vkr_stopped=1; break; }
         int layer=cand[i2].layer, eid=cand[i2].eid; tried++;
@@ -6550,13 +6584,51 @@ static void vk_registry_fill(Model *m){
         g_vk_reg_n++;
     }
     coli_vk_alloc_priority(0.75f);               /* back to the dense/default class */
-    if(tmp.slab){ compat_aligned_free(tmp.slab); free(tmp.fslab); }
-    free(cand);
     fprintf(stderr,"[VK] expert tier: %d hot experts resident (%.2f GB VRAM, %.1fs, top-%d of history)\n",
             g_vk_reg_n,bytes/1e9,now_s()-t0,tried);
     if(vkr_stopped)
         fprintf(stderr,"[VK] expert tier: budget stop at %d experts — %.1f of %.1f GB device-local used, %.1f GB reserved (COLI_VK_RESERVE_GB)\n",
                 g_vk_reg_n,vkr_used,vkr_budget,vkr_reserve);
+    /* DEV2 tier: continue down the heat ranking onto the second GPU (COLI_VK_DEV2),
+     * starting at the candidate dev0 stopped on. Same fmt gates, its own budget. */
+    if(g_vk_budget2>0 && coli_vk_dev2_available()){
+        double t20=now_s(); int64_t bytes2=0; int tried2=0;
+        double vkr2_reserve = getenv("COLI_VK_RESERVE2_GB")?atof(getenv("COLI_VK_RESERVE2_GB")):0.5;
+        int vkr2_stopped=0; double u2=0,b2=0;
+        for(;i2<n && g_vk_reg_n2<g_vk_budget2;i2++){
+            if(vkr2_reserve>0 && (g_vk_reg_n2&7)==0 && coli_vk_mem_budget2(&u2,&b2)
+               && b2-u2 < vkr2_reserve){ vkr2_stopped=1; break; }
+            int layer=cand[i2].layer, eid=cand[i2].eid; tried2++;
+            ESlot *src=NULL, *P=m->pin[layer];
+            for(int z=0;z<m->npin[layer];z++) if(P[z].eid==eid && P[z].slab){ src=&P[z]; break; }
+            if(!src){ if(expert_load(m,layer,eid,&tmp,0,0)!=0){
+                    if(++loadfail>=64) break;
+                    continue; } src=&tmp; }
+            int xf=src->g.fmt;
+            if((xf!=2&&xf!=4&&xf!=5)||src->u.fmt!=xf||src->u.gs!=src->g.gs
+               ||(src->d.fmt!=2&&src->d.fmt!=4&&src->d.fmt!=5)
+               ||(xf==4&&(src->g.gs<8||src->g.gs%8))||(src->d.fmt==4&&(src->d.gs<8||src->d.gs%8)))
+                continue;
+            ColiVkTensor **slot=vk_reg_at(layer,eid);
+            if(!coli_vk_tensor_ensure2(&slot[0],src->g.q4,src->g.s,xf,c->hidden,c->moe_inter,src->g.gs)||
+               !coli_vk_tensor_ensure2(&slot[1],src->u.q4,src->u.s,xf,c->hidden,c->moe_inter,src->u.gs)||
+               !coli_vk_tensor_ensure2(&slot[2],src->d.q4,src->d.s,src->d.fmt,c->moe_inter,c->hidden,src->d.gs)){
+                if(slot[0]){coli_vk_tensor_free(slot[0]);slot[0]=NULL;}
+                if(slot[1]){coli_vk_tensor_free(slot[1]);slot[1]=NULL;}
+                fprintf(stderr,"[VK] dev2 tier: VRAM full after %d experts\n",g_vk_reg_n2);
+                break;
+            }
+            bytes2+=coli_vk_tensor_bytes(slot[0])+coli_vk_tensor_bytes(slot[1])+coli_vk_tensor_bytes(slot[2]);
+            g_vk_reg_n2++;
+        }
+        fprintf(stderr,"[VK] dev2 tier: %d experts resident (%.2f GB VRAM, %.1fs, next-%d of history)\n",
+                g_vk_reg_n2,bytes2/1e9,now_s()-t20,tried2);
+        if(vkr2_stopped)
+            fprintf(stderr,"[VK] dev2 tier: budget stop at %d experts — %.1f of %.1f GB device-local used, %.1f GB reserved (COLI_VK_RESERVE2_GB)\n",
+                    g_vk_reg_n2,u2,b2,vkr2_reserve);
+    }
+    if(tmp.slab){ compat_aligned_free(tmp.slab); free(tmp.fslab); }
+    free(cand);
 }
 #endif
 
@@ -7413,6 +7485,16 @@ int main(int argc, char **argv){
         fprintf(stderr,"[VK] expert tier active: routed quantized experts on the GPU (budget %d)%s%s\n",
                 g_vk_budget, g_vk_dense ? " + dense projections + shared expert" : "",
                 g_vk_attn ? " + absorb attention core" : "");
+        /* COLI_VK_DEV2=auto|<index>: bring up a SECOND GPU for tier experts only
+         * (e.g. an RX 580 beside the primary card). The dev2 tier fills with the
+         * next heat-ranked experts after dev0's budget stop, capped by
+         * COLI_VK_EXPERTS2 and its own VRAM budget (COLI_VK_RESERVE2_GB). */
+        { const char *d2 = getenv("COLI_VK_DEV2");
+          if(d2 && *d2){
+              int idx = strcmp(d2,"auto") ? atoi(d2) : -1;
+              if(coli_vk_init_dev2(spv, idx))
+                  g_vk_budget2 = getenv("COLI_VK_EXPERTS2") ? atoi(getenv("COLI_VK_EXPERTS2")) : 512;
+          } }
     }
 #endif
 #ifdef COLI_CUDA

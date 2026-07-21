@@ -23,6 +23,7 @@ struct ColiVkTensor {
     VkDeviceMemory wmem, smem;
     size_t wbytes;
     int fmt, I, O, rowWords, gs;
+    int dev;               /* 0 = primary device, 1 = the COLI_VK_DEV2 expert-tier device */
 };
 
 typedef struct {
@@ -108,9 +109,9 @@ struct PCN { int S, D; float eps; };
 /* Push constants of the absorb attention kernel (must match attention_absorb.comp). */
 struct PCAttn { int fmt, S, H, Q, R, V, K, st0, T, rowWords, cap; float scale; int gs; };
 
-static int pick_memtype(void) {
+static int pick_memtype(VkPhysicalDevice phys) {
     VkPhysicalDeviceMemoryProperties m;
-    vkGetPhysicalDeviceMemoryProperties(G.phys, &m);
+    vkGetPhysicalDeviceMemoryProperties(phys, &m);
     int best = -1;
     for (uint32_t i = 0; i < m.memoryTypeCount; i++) {
         VkMemoryPropertyFlags f = m.memoryTypes[i].propertyFlags;
@@ -126,15 +127,15 @@ static int pick_memtype(void) {
 /* Cached+coherent host-visible type for buffers the CPU READS BACK. pick_memtype prefers
  * DEVICE_LOCAL host-visible = write-combined VRAM over ReBAR, which the CPU writes fast but
  * reads catastrophically slowly (~40 MB/s). Outputs must be HOST_CACHED for cheap readback. */
-static int pick_memtype_cached(void) {
+static int pick_memtype_cached(VkPhysicalDevice phys) {
     VkPhysicalDeviceMemoryProperties m;
-    vkGetPhysicalDeviceMemoryProperties(G.phys, &m);
+    vkGetPhysicalDeviceMemoryProperties(phys, &m);
     for (uint32_t i = 0; i < m.memoryTypeCount; i++) {
         VkMemoryPropertyFlags f = m.memoryTypes[i].propertyFlags;
         if ((f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && (f & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) &&
             (f & VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) return (int)i;
     }
-    return pick_memtype();   /* no cached type -> fall back (no worse than before) */
+    return pick_memtype(phys);   /* no cached type -> fall back (no worse than before) */
 }
 
 static int alloc_hostvis_mt(size_t bytes, VkBuffer *buf, VkDeviceMemory *mem, void **ptr, uint32_t memtype) {
@@ -214,7 +215,7 @@ static size_t scale_floats(int fmt, int I, int O, int gs) {
     return (size_t)O;
 }
 
-static VkShaderModule load_spv(const char *path) {
+static VkShaderModule load_spv(VkDevice dev, const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "[VK] cannot open %s\n", path); return VK_NULL_HANDLE; }
     fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
@@ -227,7 +228,7 @@ static VkShaderModule load_spv(const char *path) {
     VkShaderModuleCreateInfo si = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
         .codeSize = n, .pCode = code};
     VkShaderModule m;
-    VkResult r = vkCreateShaderModule(G.dev, &si, NULL, &m);
+    VkResult r = vkCreateShaderModule(dev, &si, NULL, &m);
     free(code);
     return r == VK_SUCCESS ? m : VK_NULL_HANDLE;
 }
@@ -235,7 +236,7 @@ static VkShaderModule load_spv(const char *path) {
 /* Build a compute pipeline + descriptor pool/set for nbind storage buffers with a
  * pc_size-byte push constant. Used by the 4-binding matmul, 6-binding gate_up and
  * 7-binding absorb attention pipelines. */
-static int build_pipeline(int nbind, size_t pc_size, VkShaderModule shader,
+static int build_pipeline(VkDevice dev, int nbind, size_t pc_size, VkShaderModule shader,
                           VkDescriptorSetLayout *dsl, VkPipelineLayout *plyt, VkPipeline *pipe,
                           VkDescriptorPool *dpool, VkDescriptorSet *dset) {
     VkDescriptorSetLayoutBinding b[8];
@@ -244,23 +245,23 @@ static int build_pipeline(int nbind, size_t pc_size, VkShaderModule shader,
         .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT};
     VkDescriptorSetLayoutCreateInfo dsli = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
         .bindingCount = (uint32_t)nbind, .pBindings = b};
-    VKCHECK(vkCreateDescriptorSetLayout(G.dev, &dsli, NULL, dsl), "descSetLayout");
+    VKCHECK(vkCreateDescriptorSetLayout(dev, &dsli, NULL, dsl), "descSetLayout");
     VkPushConstantRange pcr = {.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT, .offset = 0, .size = (uint32_t)pc_size};
     VkPipelineLayoutCreateInfo pli = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
         .setLayoutCount = 1, .pSetLayouts = dsl, .pushConstantRangeCount = 1, .pPushConstantRanges = &pcr};
-    VKCHECK(vkCreatePipelineLayout(G.dev, &pli, NULL, plyt), "pipelineLayout");
+    VKCHECK(vkCreatePipelineLayout(dev, &pli, NULL, plyt), "pipelineLayout");
     VkComputePipelineCreateInfo cpi = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
         .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
                   .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = shader, .pName = "main"},
         .layout = *plyt};
-    VKCHECK(vkCreateComputePipelines(G.dev, VK_NULL_HANDLE, 1, &cpi, NULL, pipe), "pipeline");
+    VKCHECK(vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &cpi, NULL, pipe), "pipeline");
     VkDescriptorPoolSize ps = {.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = (uint32_t)nbind};
     VkDescriptorPoolCreateInfo dpi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
         .maxSets = 1, .poolSizeCount = 1, .pPoolSizes = &ps};
-    VKCHECK(vkCreateDescriptorPool(G.dev, &dpi, NULL, dpool), "descPool");
+    VKCHECK(vkCreateDescriptorPool(dev, &dpi, NULL, dpool), "descPool");
     VkDescriptorSetAllocateInfo dsa = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
         .descriptorPool = *dpool, .descriptorSetCount = 1, .pSetLayouts = dsl};
-    VKCHECK(vkAllocateDescriptorSets(G.dev, &dsa, dset), "allocDescSet");
+    VKCHECK(vkAllocateDescriptorSets(dev, &dsa, dset), "allocDescSet");
     return 1;
 }
 
@@ -358,30 +359,30 @@ int coli_vk_init(const char *spv_path) {
         fprintf(stderr, "[VK] VRAM pressure-proofing: memory_priority %s, memory_budget %s\n",
                 G.has_prio ? "on" : "absent", G.has_budget ? "on" : "absent");
 
-    int mt = pick_memtype();
+    int mt = pick_memtype(G.phys);
     if (mt < 0) { fprintf(stderr, "[VK] no host-visible memory\n"); return 0; }
     G.memtype = (uint32_t)mt;
-    G.memtype_cached = (uint32_t)pick_memtype_cached();
+    G.memtype_cached = (uint32_t)pick_memtype_cached(G.phys);
 
-    G.shader = load_spv(spv_path);
+    G.shader = load_spv(G.dev, spv_path);
     if (!G.shader) return 0;
-    if (!build_pipeline(4, sizeof(struct PC), G.shader, &G.dsl, &G.plyt, &G.pipe, &G.dpool, &G.dset)) return 0;
+    if (!build_pipeline(G.dev, 4, sizeof(struct PC), G.shader, &G.dsl, &G.plyt, &G.pipe, &G.dpool, &G.dset)) return 0;
 
     /* Optional fused gate+up pipeline: skip gracefully if its shader isn't present
      * (single-matmul path keeps working). */
     char gu_path[512]; derive_sibling(spv_path, "_gate_up.spv", gu_path, sizeof(gu_path));
-    G.shader_gu = load_spv(gu_path);
-    if (G.shader_gu && !build_pipeline(6, sizeof(struct PC), G.shader_gu, &G.dsl_gu, &G.plyt_gu, &G.pipe_gu, &G.dpool_gu, &G.dset_gu))
+    G.shader_gu = load_spv(G.dev, gu_path);
+    if (G.shader_gu && !build_pipeline(G.dev, 6, sizeof(struct PC), G.shader_gu, &G.dsl_gu, &G.plyt_gu, &G.pipe_gu, &G.dpool_gu, &G.dset_gu))
         return 0;
 
     /* Optional MLA absorb attention pipeline (same directory as the main shader). */
     /* Optional rmsnorm pipeline: enables the pair->norm->q_b single-submit chain
      * (coli_vk_attn_qprep); absent -> callers keep the 3-submit path. */
     char nrm_path[512]; derive_dir_file(spv_path, "rmsnorm.spv", nrm_path, sizeof(nrm_path));
-    G.shader_nrm = load_spv(nrm_path);
+    G.shader_nrm = load_spv(G.dev, nrm_path);
     if (G.shader_nrm) {
         VkDescriptorPool np; VkDescriptorSet ns;
-        if (!build_pipeline(3, sizeof(struct PCN), G.shader_nrm, &G.dsl_nrm, &G.plyt_nrm, &G.pipe_nrm, &np, &ns))
+        if (!build_pipeline(G.dev, 3, sizeof(struct PCN), G.shader_nrm, &G.dsl_nrm, &G.plyt_nrm, &G.pipe_nrm, &np, &ns))
             return 0;
         G.dset_nrm = ns;
         /* one extra 4-binding matmul set for the chain's 3rd matmul (dset+dset_pair serve 1+2) */
@@ -394,8 +395,8 @@ int coli_vk_init(const char *spv_path) {
         VKCHECK(vkAllocateDescriptorSets(G.dev, &dsa3, &G.dset_qp3), "qprep descSet");
     }
     char att_path[512]; derive_dir_file(spv_path, "attention_absorb.spv", att_path, sizeof(att_path));
-    G.shader_att = load_spv(att_path);
-    if (G.shader_att && !build_pipeline(7, sizeof(struct PCAttn), G.shader_att, &G.dsl_att, &G.plyt_att, &G.pipe_att, &G.dpool_att, &G.dset_att))
+    G.shader_att = load_spv(G.dev, att_path);
+    if (G.shader_att && !build_pipeline(G.dev, 7, sizeof(struct PCAttn), G.shader_att, &G.dsl_att, &G.plyt_att, &G.pipe_att, &G.dpool_att, &G.dset_att))
         return 0;
 
     VkCommandPoolCreateInfo cpci = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
@@ -521,7 +522,7 @@ int coli_vk_tensor_ensure(ColiVkTensor **tensor, const void *weights, const floa
  * then fall back to the blocking wait. The spinning thread is stalled on the
  * GPU result anyway. COLI_VK_SPIN_US=0 restores the pure blocking wait. */
 static long g_vk_spin_us = -1;
-static VkResult vk_fence_wait(VkFence f) {
+static VkResult vk_fence_wait(VkDevice dev, VkFence f) {
     if (g_vk_spin_us < 0) {
         const char *e = getenv("COLI_VK_SPIN_US");
         g_vk_spin_us = e ? atol(e) : 300;
@@ -530,11 +531,11 @@ static VkResult vk_fence_wait(VkFence f) {
     if (g_vk_spin_us > 0) {
         double t0 = vk_now();
         do {
-            VkResult r = vkGetFenceStatus(G.dev, f);
+            VkResult r = vkGetFenceStatus(dev, f);
             if (r != VK_NOT_READY) return r;   /* VK_SUCCESS or a real error */
         } while ((vk_now() - t0) * 1000.0 < (double)g_vk_spin_us);
     }
-    return vkWaitForFences(G.dev, 1, &f, VK_TRUE, 10000000000ULL);
+    return vkWaitForFences(dev, 1, &f, VK_TRUE, 10000000000ULL);
 }
 
 /* Global submit/wait totals across EVERY synchronous GPU path (VK_PROF=1) — the
@@ -609,7 +610,7 @@ int coli_vk_matmul(ColiVkTensor **tensor, float *y, const float *x,
     // Bounded wait: a GPU hang/TDR must never wedge the process. 10s is orders of
     // magnitude over a single-GEMV dispatch; on timeout/device-loss disable VK for
     // the rest of the run and fall back to CPU (the caller degrades on our 0 return).
-    VkResult wr = vk_fence_wait(G.fence);
+    VkResult wr = vk_fence_wait(G.dev, G.fence);
     if (wr != VK_SUCCESS) {
         fprintf(stderr, "[VK] fence wait failed: %d — disabling GPU offload, staying on CPU\n", wr);
         G.ready = 0;
@@ -665,19 +666,22 @@ int coli_vk_gate_up(ColiVkTensor **gate, ColiVkTensor **up, float *hidden, const
     double vp0 = G.eg_prof ? vk_now() : 0;
     VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.fence), "queueSubmit");
     if (G.eg_prof) { double vp1 = vk_now(); g_vsub_ms += vp1 - vp0; vp0 = vp1; }
-    if (vk_fence_wait(G.fence) != VK_SUCCESS) { G.ready = 0; return 0; }
+    if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) { G.ready = 0; return 0; }
     if (G.eg_prof) { g_vwait_ms += vk_now() - vp0; vkprof_tick(); }
     memcpy(hidden, G.h.ptr, hb);
     G.cmd_ready = 0; G.bound_tensor = NULL;   /* the shared command buffer/binding was clobbered */
     return 1;
 }
 
-static void wr_desc(VkDescriptorSet set, int n, const VkDescriptorBufferInfo *bi) {
+static void wr_desc_dev(VkDevice dev, VkDescriptorSet set, int n, const VkDescriptorBufferInfo *bi) {
     VkWriteDescriptorSet w[6];
     for (int i = 0; i < n; i++) w[i] = (VkWriteDescriptorSet){
         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = (uint32_t)i,
         .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi[i]};
-    vkUpdateDescriptorSets(G.dev, (uint32_t)n, w, 0, NULL);
+    vkUpdateDescriptorSets(dev, (uint32_t)n, w, 0, NULL);
+}
+static void wr_desc(VkDescriptorSet set, int n, const VkDescriptorBufferInfo *bi) {
+    wr_desc_dev(G.dev, set, n, bi);
 }
 
 /* Full batched expert MLP for `count` experts, hidden staying on-device:
@@ -783,7 +787,7 @@ int coli_vk_expert_group_issue(ColiVkTensor *const *gates, ColiVkTensor *const *
 int coli_vk_expert_group_take(float *y) {
     if (!G.eg_inflight) return 0;
     G.eg_inflight = 0;
-    if (vk_fence_wait(G.eg_fence) != VK_SUCCESS) {
+    if (vk_fence_wait(G.dev, G.eg_fence) != VK_SUCCESS) {
         fprintf(stderr, "[VK] expert-group fence wait failed — disabling GPU offload\n");
         G.ready = 0; return 0;
     }
@@ -804,6 +808,324 @@ int coli_vk_expert_group(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
     if (G.eg_inflight) return 0;
     if (!eg_prepare_submit(gates, ups, downs, rows, count, x)) return 0;
     return coli_vk_expert_group_take(y);
+}
+
+/* ==================== SECOND DEVICE: expert tier only (COLI_VK_DEV2) ============
+ * A self-contained context for a second Vulkan GPU (e.g. an RX 580 beside the
+ * RX 9070) that hosts ONLY resident tier experts and runs ONLY the async
+ * expert-group path (fused gate_up -> down). Attention, dense, q-prep and the
+ * KV mirror stay on device 0. Deliberately separate from G so the device-0 hot
+ * path is untouched and both groups can be in flight simultaneously. The same
+ * physical device as dev0 is allowed when forced by index (a second logical
+ * device — the pre-hardware test mode); `auto` requires a distinct real GPU. */
+static struct {
+    int ready;
+    VkPhysicalDevice phys; VkDevice dev; VkQueue queue; uint32_t qfam;
+    uint32_t memtype, memtype_cached;
+    VkShaderModule sh_qmm, sh_gu;
+    VkDescriptorSetLayout dsl, dsl_gu; VkPipelineLayout plyt, plyt_gu;
+    VkPipeline pipe, pipe_gu;
+    VkCommandPool cpool; VkCommandBuffer cmd; VkFence fence;
+    VkDescriptorPool pool; VkDescriptorSet gu[64], dn[64]; int nsets;
+    Scratch x, h, y;
+    int inflight; size_t pending_yb;
+    VkWArena *arena;
+    size_t used_bytes, tensor_count;
+    int has_budget;
+} G2;
+
+static int alloc_hostvis_d2(size_t bytes, VkBuffer *buf, VkDeviceMemory *mem, void **ptr, uint32_t memtype) {
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = bytes, .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+    VKCHECK(vkCreateBuffer(G2.dev, &bi, NULL, buf), "d2 vkCreateBuffer");
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(G2.dev, *buf, &req);
+    VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize = req.size, .memoryTypeIndex = memtype};
+    VKCHECK(vkAllocateMemory(G2.dev, &ai, NULL, mem), "d2 vkAllocateMemory");
+    VKCHECK(vkBindBufferMemory(G2.dev, *buf, *mem, 0), "d2 vkBindBufferMemory");
+    if (ptr) VKCHECK(vkMapMemory(G2.dev, *mem, 0, bytes, 0, ptr), "d2 vkMapMemory");
+    return 1;
+}
+static int scratch_reserve_d2(Scratch *s, size_t bytes, uint32_t memtype) {
+    if (s->cap >= bytes) return 1;
+    if (s->buf) { vkDestroyBuffer(G2.dev, s->buf, NULL); vkFreeMemory(G2.dev, s->mem, NULL); }
+    s->buf = VK_NULL_HANDLE; s->cap = 0; s->ptr = NULL;
+    if (!alloc_hostvis_d2(bytes, &s->buf, &s->mem, &s->ptr, memtype)) return 0;
+    s->cap = bytes;
+    return 1;
+}
+static int arena_suballoc_d2(size_t bytes, VkBuffer *buf, void **ptr) {
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = bytes, .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+    VKCHECK(vkCreateBuffer(G2.dev, &bi, NULL, buf), "d2 vkCreateBuffer");
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(G2.dev, *buf, &req);
+    if (!(req.memoryTypeBits & (1u << G2.memtype))) { vkDestroyBuffer(G2.dev, *buf, NULL); *buf = VK_NULL_HANDLE; return 0; }
+    size_t align = req.alignment ? req.alignment : 256, off = 0;
+    VkWArena *a = G2.arena;
+    for (; a; a = a->next) {
+        off = (a->off + align - 1) & ~(align - 1);
+        if (off + req.size <= a->cap) break;
+    }
+    if (!a) {
+        size_t cap = req.size > VK_WARENA_BLOCK ? (req.size + 4095) & ~(size_t)4095 : VK_WARENA_BLOCK;
+        a = calloc(1, sizeof(*a));
+        if (!a) { vkDestroyBuffer(G2.dev, *buf, NULL); *buf = VK_NULL_HANDLE; return 0; }
+        VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            .allocationSize = cap, .memoryTypeIndex = G2.memtype};
+        if (vkAllocateMemory(G2.dev, &ai, NULL, &a->mem) != VK_SUCCESS ||
+            vkMapMemory(G2.dev, a->mem, 0, cap, 0, (void **)&a->base) != VK_SUCCESS) {
+            if (a->mem) vkFreeMemory(G2.dev, a->mem, NULL);
+            free(a); vkDestroyBuffer(G2.dev, *buf, NULL); *buf = VK_NULL_HANDLE; return 0;
+        }
+        a->cap = cap; a->next = G2.arena; G2.arena = a;
+        off = 0;
+    }
+    VKCHECK(vkBindBufferMemory(G2.dev, *buf, a->mem, off), "d2 vkBindBufferMemory");
+    if (ptr) *ptr = a->base + off;
+    a->off = off + req.size;
+    return 1;
+}
+static int upload_tensor_d2(ColiVkTensor **out, const void *weights, const float *scales,
+                            int fmt, int I, int O, int gs) {
+    if (*out) return (*out)->fmt == fmt && (*out)->I == I && (*out)->O == O;
+    if (fmt != 1 && fmt != 2 && fmt != 5 &&
+        !(fmt == 4 && gs >= 8 && gs % 8 == 0)) return 0;
+    ColiVkTensor *t = calloc(1, sizeof(*t));
+    if (!t) return 0;
+    t->fmt = fmt; t->I = I; t->O = O; t->rowWords = rowwords(fmt, I); t->gs = fmt == 4 ? gs : 0;
+    t->dev = 1;
+    size_t stride = (size_t)t->rowWords * 4;
+    size_t cpu_rb = fmt == 1 ? (size_t)I
+                  : fmt == 5 ? ((size_t)I + 63) / 64 * 24 : (size_t)(I + 1) / 2;
+    size_t sfl = scale_floats(fmt, I, O, gs);
+    t->wbytes = stride * (size_t)O;
+    void *wptr;
+    if (!arena_suballoc_d2(t->wbytes, &t->wbuf, &wptr)) { free(t); return 0; }
+    memset(wptr, 0, t->wbytes);
+    for (int o = 0; o < O; o++)
+        memcpy((uint8_t *)wptr + (size_t)o * stride,
+               (const uint8_t *)weights + (size_t)o * cpu_rb, cpu_rb);
+    void *sptr;
+    if (!arena_suballoc_d2(sfl * sizeof(float), &t->sbuf, &sptr)) {
+        vkDestroyBuffer(G2.dev, t->wbuf, NULL); free(t); return 0;
+    }
+    memcpy(sptr, scales, sfl * sizeof(float));
+    __atomic_add_fetch(&G2.used_bytes, t->wbytes + sfl * sizeof(float), __ATOMIC_RELAXED);
+    __atomic_add_fetch(&G2.tensor_count, 1, __ATOMIC_RELAXED);
+    *out = t;
+    return 1;
+}
+
+/* Bring up the second device. devidx: -1 = auto (best-ranked real GPU that is NOT
+ * device 0; fails if none), >=0 = that enumeration index (same-physical-device
+ * allowed with a warning — the pre-hardware test mode). Requires coli_vk_init. */
+int coli_vk_init_dev2(const char *spv_path, int devidx) {
+    if (G2.ready) return 1;
+    if (!G.ready) return 0;
+    uint32_t nd = 0;
+    vkEnumeratePhysicalDevices(G.inst, &nd, NULL);
+    VkPhysicalDevice devs[8]; if (nd > 8) nd = 8;
+    if (!nd) return 0;
+    vkEnumeratePhysicalDevices(G.inst, &nd, devs);
+    if (devidx >= 0) {
+        if ((uint32_t)devidx >= nd) { fprintf(stderr, "[VK] dev2: index %d out of range (%u devices)\n", devidx, nd); return 0; }
+        G2.phys = devs[devidx];
+        if (G2.phys == G.phys)
+            fprintf(stderr, "[VK] dev2: SAME physical device as dev0 — second logical device (test mode)\n");
+    } else {
+        int bestrank = -1;
+        for (uint32_t i = 0; i < nd; i++) {
+            if (devs[i] == G.phys) continue;
+            VkPhysicalDeviceProperties p; vkGetPhysicalDeviceProperties(devs[i], &p);
+            int rank = p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU   ? 4 :
+                       p.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 3 : -1;
+            if (rank > bestrank) { bestrank = rank; G2.phys = devs[i]; }
+        }
+        if (bestrank < 0) { fprintf(stderr, "[VK] dev2=auto: no second real GPU found\n"); return 0; }
+    }
+    uint32_t nq = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(G2.phys, &nq, NULL);
+    VkQueueFamilyProperties qf[16]; if (nq > 16) nq = 16;
+    vkGetPhysicalDeviceQueueFamilyProperties(G2.phys, &nq, qf);
+    G2.qfam = UINT32_MAX;
+    for (uint32_t i = 0; i < nq; i++)
+        if (qf[i].queueFlags & VK_QUEUE_COMPUTE_BIT) { G2.qfam = i; break; }
+    if (G2.qfam == UINT32_MAX) { fprintf(stderr, "[VK] dev2: no compute queue\n"); return 0; }
+    float qprio = 1.0f;
+    VkDeviceQueueCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+        .queueFamilyIndex = G2.qfam, .queueCount = 1, .pQueuePriorities = &qprio};
+    const char *dext[1]; uint32_t ndext = 0;
+#ifdef VK_EXT_memory_budget
+    {
+        uint32_t ne = 0;
+        vkEnumerateDeviceExtensionProperties(G2.phys, NULL, &ne, NULL);
+        VkExtensionProperties *ep = ne ? malloc(ne * sizeof(*ep)) : NULL;
+        if (ep) {
+            vkEnumerateDeviceExtensionProperties(G2.phys, NULL, &ne, ep);
+            for (uint32_t i = 0; i < ne; i++)
+                if (!strcmp(ep[i].extensionName, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) G2.has_budget = 1;
+            free(ep);
+        }
+        if (G2.has_budget) dext[ndext++] = VK_EXT_MEMORY_BUDGET_EXTENSION_NAME;
+    }
+#endif
+    VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+        .queueCreateInfoCount = 1, .pQueueCreateInfos = &qi,
+        .enabledExtensionCount = ndext, .ppEnabledExtensionNames = ndext ? dext : NULL};
+    VKCHECK(vkCreateDevice(G2.phys, &di, NULL, &G2.dev), "d2 vkCreateDevice");
+    vkGetDeviceQueue(G2.dev, G2.qfam, 0, &G2.queue);
+    int mt = pick_memtype(G2.phys);
+    if (mt < 0) { fprintf(stderr, "[VK] dev2: no host-visible memory\n"); return 0; }
+    G2.memtype = (uint32_t)mt;
+    G2.memtype_cached = (uint32_t)pick_memtype_cached(G2.phys);
+    G2.sh_qmm = load_spv(G2.dev, spv_path);
+    if (!G2.sh_qmm) return 0;
+    char gu_path[512]; derive_sibling(spv_path, "_gate_up.spv", gu_path, sizeof(gu_path));
+    G2.sh_gu = load_spv(G2.dev, gu_path);
+    if (!G2.sh_gu) { fprintf(stderr, "[VK] dev2: gate_up shader required for the tier\n"); return 0; }
+    VkDescriptorPool dp; VkDescriptorSet ds;   /* build_pipeline's singleton set: unused here */
+    if (!build_pipeline(G2.dev, 4, sizeof(struct PC), G2.sh_qmm, &G2.dsl, &G2.plyt, &G2.pipe, &dp, &ds)) return 0;
+    if (!build_pipeline(G2.dev, 6, sizeof(struct PC), G2.sh_gu, &G2.dsl_gu, &G2.plyt_gu, &G2.pipe_gu, &dp, &ds)) return 0;
+    VkCommandPoolCreateInfo cpci = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+        .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = G2.qfam};
+    VKCHECK(vkCreateCommandPool(G2.dev, &cpci, NULL, &G2.cpool), "d2 cmdPool");
+    VkCommandBufferAllocateInfo cbi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool = G2.cpool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
+    VKCHECK(vkAllocateCommandBuffers(G2.dev, &cbi, &G2.cmd), "d2 cmdBuf");
+    VkFenceCreateInfo fi = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    VKCHECK(vkCreateFence(G2.dev, &fi, NULL, &G2.fence), "d2 fence");
+    G2.ready = 1;
+    VkPhysicalDeviceProperties p; vkGetPhysicalDeviceProperties(G2.phys, &p);
+    fprintf(stderr, "[VK] dev2 ready: %s (expert tier only), compute qfam %u, memtype %u\n",
+            p.deviceName, G2.qfam, G2.memtype);
+    return 1;
+}
+
+int coli_vk_dev2_available(void) { return G2.ready; }
+int coli_vk_tensor_dev(const ColiVkTensor *t) { return t ? t->dev : 0; }
+
+int coli_vk_mem_budget2(double *used_gb, double *budget_gb) {
+#ifdef VK_EXT_memory_budget
+    if (!G2.has_budget || !G2.phys) return 0;
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT bud = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+    VkPhysicalDeviceMemoryProperties2 mp2 = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, .pNext = &bud};
+    vkGetPhysicalDeviceMemoryProperties2(G2.phys, &mp2);
+    double u = 0, b = 0;
+    for (uint32_t i = 0; i < mp2.memoryProperties.memoryHeapCount; i++)
+        if (mp2.memoryProperties.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
+            u += (double)bud.heapUsage[i]; b += (double)bud.heapBudget[i];
+        }
+    if (used_gb) *used_gb = u / 1e9;
+    if (budget_gb) *budget_gb = b / 1e9;
+    return b > 0;
+#else
+    (void)used_gb; (void)budget_gb; return 0;
+#endif
+}
+
+int coli_vk_tensor_ensure2(ColiVkTensor **tensor, const void *weights, const float *scales, int fmt, int I, int O, int grp) {
+    if (!G2.ready) return 0;
+    return upload_tensor_d2(tensor, weights, scales, fmt, I, O, grp);
+}
+
+/* dev2 mirror of eg_prepare_submit: identical structure on G2's pipelines/scratches. */
+static int eg2_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
+                              ColiVkTensor *const *downs, const int *rows, int count,
+                              const float *x) {
+    if (!G2.ready || count < 1 || count > 64) return 0;
+    ColiVkTensor *g0 = gates[0]; if (!g0) return 0;
+    int D = g0->I, I = g0->O, fmt = g0->fmt, total = 0, off[64];
+    if (D > 6144) return 0;
+    int dfmt = downs[0]->fmt;
+    for (int c = 0; c < count; c++) {
+        off[c] = total; total += rows[c];
+        if (rows[c] < 1 || gates[c]->I != D || gates[c]->O != I || gates[c]->fmt != fmt ||
+            ups[c]->I != D || ups[c]->O != I || ups[c]->fmt != fmt ||
+            downs[c]->I != I || downs[c]->O != D || downs[c]->fmt != dfmt) return 0;
+    }
+    size_t xb = (size_t)total*D*4, hb = (size_t)total*I*4, yb = (size_t)total*D*4;
+    if (!scratch_reserve_d2(&G2.x, xb, G2.memtype) || !scratch_reserve_d2(&G2.h, hb, G2.memtype) ||
+        !scratch_reserve_d2(&G2.y, yb, G2.memtype_cached)) return 0;
+    memcpy(G2.x.ptr, x, xb);
+    if (!G2.pool) {
+        VkDescriptorPoolSize ps = {.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 64*6 + 64*4};
+        VkDescriptorPoolCreateInfo dpi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 128, .poolSizeCount = 1, .pPoolSizes = &ps};
+        VKCHECK(vkCreateDescriptorPool(G2.dev, &dpi, NULL, &G2.pool), "d2 eg descPool");
+        VkDescriptorSetLayout lg[64], ld[64];
+        for (int c = 0; c < 64; c++) { lg[c] = G2.dsl_gu; ld[c] = G2.dsl; }
+        VkDescriptorSetAllocateInfo ag = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = G2.pool, .descriptorSetCount = 64, .pSetLayouts = lg};
+        VkDescriptorSetAllocateInfo ad = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = G2.pool, .descriptorSetCount = 64, .pSetLayouts = ld};
+        VKCHECK(vkAllocateDescriptorSets(G2.dev, &ag, G2.gu), "d2 eg gu sets");
+        VKCHECK(vkAllocateDescriptorSets(G2.dev, &ad, G2.dn), "d2 eg dn sets");
+        G2.nsets = 64;
+    }
+    for (int c = 0; c < count; c++) {
+        VkDeviceSize xo = (VkDeviceSize)off[c]*D*4, ho = (VkDeviceSize)off[c]*I*4, yo = (VkDeviceSize)off[c]*D*4;
+        VkDescriptorBufferInfo gi[6] = {
+            {G2.x.buf, xo, (VkDeviceSize)rows[c]*D*4}, {gates[c]->wbuf, 0, VK_WHOLE_SIZE},
+            {gates[c]->sbuf, 0, VK_WHOLE_SIZE}, {ups[c]->wbuf, 0, VK_WHOLE_SIZE},
+            {ups[c]->sbuf, 0, VK_WHOLE_SIZE}, {G2.h.buf, ho, (VkDeviceSize)rows[c]*I*4}};
+        wr_desc_dev(G2.dev, G2.gu[c], 6, gi);
+        VkDescriptorBufferInfo di[4] = {
+            {G2.h.buf, ho, (VkDeviceSize)rows[c]*I*4}, {downs[c]->wbuf, 0, VK_WHOLE_SIZE},
+            {downs[c]->sbuf, 0, VK_WHOLE_SIZE}, {G2.y.buf, yo, (VkDeviceSize)rows[c]*D*4}};
+        wr_desc_dev(G2.dev, G2.dn[c], 4, di);
+    }
+    VKCHECK(vkResetCommandBuffer(G2.cmd, 0), "d2 eg resetCmd");
+    VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    VKCHECK(vkBeginCommandBuffer(G2.cmd, &begin), "d2 eg beginCmd");
+    VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT};
+    vkCmdBindPipeline(G2.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G2.pipe_gu);
+    for (int c = 0; c < count; c++) {
+        struct PC pc = {fmt, rows[c], D, I, gates[c]->rowWords, gates[c]->gs};
+        vkCmdBindDescriptorSets(G2.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G2.plyt_gu, 0, 1, &G2.gu[c], 0, NULL);
+        vkCmdPushConstants(G2.cmd, G2.plyt_gu, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+        vkCmdDispatch(G2.cmd, (uint32_t)((I + 7) / 8), (uint32_t)rows[c], 1);
+    }
+    vkCmdPipelineBarrier(G2.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+    vkCmdBindPipeline(G2.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G2.pipe);
+    for (int c = 0; c < count; c++) {
+        struct PC pc = {dfmt, rows[c], I, D, downs[c]->rowWords, downs[c]->gs};
+        vkCmdBindDescriptorSets(G2.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G2.plyt, 0, 1, &G2.dn[c], 0, NULL);
+        vkCmdPushConstants(G2.cmd, G2.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+        vkCmdDispatch(G2.cmd, (uint32_t)((D + 7) / 8), (uint32_t)rows[c], 1);
+    }
+    VKCHECK(vkEndCommandBuffer(G2.cmd), "d2 eg endCmd");
+    VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G2.cmd};
+    VKCHECK(vkResetFences(G2.dev, 1, &G2.fence), "d2 eg resetFence");
+    VKCHECK(vkQueueSubmit(G2.queue, 1, &si, G2.fence), "d2 eg queueSubmit");
+    G2.pending_yb = yb; G2.inflight = 1;
+    return 1;
+}
+
+int coli_vk_expert_group_issue2(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
+                                ColiVkTensor *const *downs, const int *rows, int count,
+                                const float *x) {
+    if (G2.inflight) return 0;
+    return eg2_prepare_submit(gates, ups, downs, rows, count, x);
+}
+int coli_vk_expert_group_take2(float *y) {
+    if (!G2.inflight) return 0;
+    G2.inflight = 0;
+    if (vk_fence_wait(G2.dev, G2.fence) != VK_SUCCESS) {
+        fprintf(stderr, "[VK] dev2 expert-group fence wait failed — disabling dev2 offload\n");
+        G2.ready = 0; return 0;
+    }
+    memcpy(y, G2.y.ptr, G2.pending_yb);
+    return 1;
+}
+int coli_vk_expert_group2(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
+                          ColiVkTensor *const *downs, const int *rows, int count,
+                          float *y, const float *x) {
+    if (G2.inflight) return 0;
+    if (!eg2_prepare_submit(gates, ups, downs, rows, count, x)) return 0;
+    return coli_vk_expert_group_take2(y);
 }
 
 /* ---- MLA absorb attention core -------------------------------------------------
@@ -900,7 +1222,7 @@ int coli_vk_attention_absorb(ColiVkTensor **kvb, const void *w, const float *sc,
     double vp0 = G.eg_prof ? vk_now() : 0;
     VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.fence), "queueSubmit");
     if (G.eg_prof) { double vp1 = vk_now(); g_vsub_ms += vp1 - vp0; vp0 = vp1; }
-    if (vk_fence_wait(G.fence) != VK_SUCCESS) { G.ready = 0; return 0; }
+    if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) { G.ready = 0; return 0; }
     if (G.eg_prof) { g_vwait_ms += vk_now() - vp0; vkprof_tick(); }
     memcpy(ctx, G.y.ptr, cb);
     G.cmd_ready = 0; G.bound_tensor = NULL;   /* the shared command buffer/binding was clobbered */
@@ -959,7 +1281,7 @@ int coli_vk_matmul_pair(ColiVkTensor **t1p, float *y1, const void *w1, const flo
     double vp0 = G.eg_prof ? vk_now() : 0;
     VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.fence), "queueSubmit");
     if (G.eg_prof) { double vp1 = vk_now(); g_vsub_ms += vp1 - vp0; vp0 = vp1; }
-    if (vk_fence_wait(G.fence) != VK_SUCCESS) { G.ready = 0; return 0; }
+    if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) { G.ready = 0; return 0; }
     if (G.eg_prof) { g_vwait_ms += vk_now() - vp0; vkprof_tick(); }
     memcpy(y1, G.y.ptr, yb1);
     memcpy(y2, G.y2.ptr, yb2);
@@ -1060,7 +1382,7 @@ int coli_vk_attn_qprep(int layer,
     double vp0 = G.eg_prof ? vk_now() : 0;
     VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.fence), "queueSubmit");
     if (G.eg_prof) { double vp1 = vk_now(); g_vsub_ms += vp1 - vp0; vp0 = vp1; }
-    if (vk_fence_wait(G.fence) != VK_SUCCESS) { G.ready = 0; return 0; }
+    if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) { G.ready = 0; return 0; }
     if (G.eg_prof) { g_vwait_ms += vk_now() - vp0; vkprof_tick(); }
     memcpy(q_out, G.y.ptr, qb_b);
     memcpy(kv_out, G.y2.ptr, kvb_b);
@@ -1133,7 +1455,7 @@ int coli_vk_attention_absorb_project(ColiVkTensor **kvb, const void *w, const fl
     double vp0 = G.eg_prof ? vk_now() : 0;
     VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.fence), "queueSubmit");
     if (G.eg_prof) { double vp1 = vk_now(); g_vsub_ms += vp1 - vp0; vp0 = vp1; }
-    if (vk_fence_wait(G.fence) != VK_SUCCESS) { G.ready = 0; return 0; }
+    if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) { G.ready = 0; return 0; }
     if (G.eg_prof) { g_vwait_ms += vk_now() - vp0; vkprof_tick(); }
     memcpy(out, G.y.ptr, ob);
     G.cmd_ready = 0; G.bound_tensor = NULL;   /* the shared command buffer/binding was clobbered */
@@ -1142,6 +1464,16 @@ int coli_vk_attention_absorb_project(ColiVkTensor **kvb, const void *w, const fl
 
 void coli_vk_tensor_free(ColiVkTensor *t) {
     if (!t) return;
+    if (t->dev == 1) {   /* dev2 tensor: destroy on ITS device, count in ITS counters */
+        if (G2.ready) {
+            if (t->wbuf) { vkDestroyBuffer(G2.dev, t->wbuf, NULL); vkFreeMemory(G2.dev, t->wmem, NULL); }
+            if (t->sbuf) { vkDestroyBuffer(G2.dev, t->sbuf, NULL); vkFreeMemory(G2.dev, t->smem, NULL); }
+        }
+        __atomic_sub_fetch(&G2.tensor_count, 1, __ATOMIC_RELAXED);
+        __atomic_sub_fetch(&G2.used_bytes, t->wbytes + scale_floats(t->fmt, t->I, t->O, t->gs) * sizeof(float), __ATOMIC_RELAXED);
+        free(t);
+        return;
+    }
     if (G.bound_tensor == t) { G.bound_tensor = NULL; G.cmd_ready = 0; }  /* drop stale cache */
     // If the device was lost/disabled (the fence-timeout path sets G.ready=0), a submission
     // may still reference these buffers — do NOT vkDestroy into a dead device (GPU-side UAF).

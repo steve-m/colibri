@@ -69,6 +69,25 @@ int  coli_vk_expert_group_take(float *y);
  * then driven by coli_vk_expert_group). Returns 0 on failure/unsupported fmt. */
 int  coli_vk_tensor_ensure(ColiVkTensor **tensor, const void *weights, const float *scales, int fmt, int I, int O, int grp);
 
+/* SECOND DEVICE (COLI_VK_DEV2): a self-contained context on another Vulkan GPU that
+ * hosts ONLY tier experts and runs ONLY the async expert-group path. devidx: -1 =
+ * auto (best real GPU that is not device 0), >=0 = enumeration index (the same
+ * physical device is allowed with a warning — pre-hardware test mode). Its group
+ * may be in flight simultaneously with device 0's. Tensors remember their device
+ * (coli_vk_tensor_dev); free/bytes work on either. */
+int  coli_vk_init_dev2(const char *spv_path, int devidx);
+int  coli_vk_dev2_available(void);
+int  coli_vk_tensor_dev(const ColiVkTensor *t);
+int  coli_vk_mem_budget2(double *used_gb, double *budget_gb);
+int  coli_vk_tensor_ensure2(ColiVkTensor **tensor, const void *weights, const float *scales, int fmt, int I, int O, int grp);
+int  coli_vk_expert_group_issue2(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
+                                 ColiVkTensor *const *downs, const int *rows, int count,
+                                 const float *x);
+int  coli_vk_expert_group_take2(float *y);
+int  coli_vk_expert_group2(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
+                           ColiVkTensor *const *downs, const int *rows, int count,
+                           float *y, const float *x);
+
 /* MLA absorb attention core (decode). The KV latent/rope caches live in persistent
  * per-layer device buffers: _ensure allocates a layer's cache at max_rows (once; resize
  * via _reset), _row mirrors one host row (absolute position), _reset drops all layers.
