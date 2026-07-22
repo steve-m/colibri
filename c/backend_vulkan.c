@@ -1050,9 +1050,15 @@ static int eg2_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *u
             downs[c]->I != I || downs[c]->O != D || downs[c]->fmt != dfmt) return 0;
     }
     size_t xb = (size_t)total*D*4, hb = (size_t)total*I*4, yb = (size_t)total*D*4;
+    /* VK_PROF=1: phase split of the dev2 issue cost (same scheme as the dense path) —
+     * localizes the per-block tax between our copy, descriptors, recording and the
+     * driver's submit on the chipset-x4 Polaris path. */
+    static double q_x, q_desc, q_rec, q_sub; static long q_n;
+    double t0 = G.eg_prof ? vk_now() : 0, tA;
     if (!scratch_reserve_d2(&G2.x, xb, G2.memtype) || !scratch_reserve_d2(&G2.h, hb, G2.memtype) ||
         !scratch_reserve_d2(&G2.y, yb, G2.memtype_cached)) return 0;
     memcpy(G2.x.ptr, x, xb);
+    if (G.eg_prof) { tA = vk_now(); q_x += tA - t0; t0 = tA; }
     if (!G2.pool) {
         VkDescriptorPoolSize ps = {.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 64*6 + 64*4};
         VkDescriptorPoolCreateInfo dpi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 128, .poolSizeCount = 1, .pPoolSizes = &ps};
@@ -1077,6 +1083,7 @@ static int eg2_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *u
             {downs[c]->sbuf, 0, VK_WHOLE_SIZE}, {G2.y.buf, yo, (VkDeviceSize)rows[c]*D*4}};
         wr_desc_dev(G2.dev, G2.dn[c], 4, di);
     }
+    if (G.eg_prof) { tA = vk_now(); q_desc += tA - t0; t0 = tA; }
     VKCHECK(vkResetCommandBuffer(G2.cmd, 0), "d2 eg resetCmd");
     VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     VKCHECK(vkBeginCommandBuffer(G2.cmd, &begin), "d2 eg beginCmd");
@@ -1097,9 +1104,15 @@ static int eg2_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *u
         vkCmdDispatch(G2.cmd, (uint32_t)((D + 7) / 8), (uint32_t)rows[c], 1);
     }
     VKCHECK(vkEndCommandBuffer(G2.cmd), "d2 eg endCmd");
+    if (G.eg_prof) { tA = vk_now(); q_rec += tA - t0; t0 = tA; }
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G2.cmd};
     VKCHECK(vkResetFences(G2.dev, 1, &G2.fence), "d2 eg resetFence");
     VKCHECK(vkQueueSubmit(G2.queue, 1, &si, G2.fence), "d2 eg queueSubmit");
+    if (G.eg_prof) { tA = vk_now(); q_sub += tA - t0;
+        if ((++q_n & 2047) == 0)
+            fprintf(stderr, "[VK_PROF d2iss] n=%ld | memcpy_x %.0f | desc %.0f | record %.0f | submit %.0f ms\n",
+                    q_n, q_x, q_desc, q_rec, q_sub);
+    }
     G2.pending_yb = yb; G2.inflight = 1;
     return 1;
 }

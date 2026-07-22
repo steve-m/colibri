@@ -311,7 +311,7 @@ static int g_vk_budget2;      /* COLI_VK_EXPERTS2: dev2 expert-tier cap (with CO
 static int g_vk_reg_n2;       /* experts resident on the dev2 tier */
 /* PROF anatomy of the VK expert block (master-thread accumulated in moe(), printed by
  * profile_print): where a decode block's wall goes besides t_ecpu/t_ewait/t_egpu. */
-static double g_vkb_cls, g_vkb_issue, g_vkb_acc;
+static double g_vkb_cls, g_vkb_issue, g_vkb_acc, g_vkb_wrk, g_vkb_join;
 static int64_t g_vkb_blocks, g_vkb_nvk, g_vkb_nvk2, g_vkb_ncpu;
 static int g_vk_attn;         /* COLI_VK_ATTN=1: run the MLA absorb attention core on Vulkan
                                * (mirrors COLI_CUDA_ATTN; KV latent cache mirrored on-device) */
@@ -3001,10 +3001,12 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
  * dev0-only) while the 580's exec itself finishes early (take-wait 0.1s) — off-thread
  * it overlaps dev0's issue + the CPU expert share. All Vulkan state it touches is
  * G2-private, and moe() joins before take2, preserving the one-in-flight invariant. */
-typedef struct { ColiVkTensor **g,**u,**d; const int *rows; int n; const float *x; int rc; } Vk2Iss;
+typedef struct { ColiVkTensor **g,**u,**d; const int *rows; int n; const float *x; int rc; double dt; } Vk2Iss;
 static void *vk2_issue_worker(void *p){
     Vk2Iss *j=(Vk2Iss*)p;
+    double t0=now_s();
     j->rc = coli_vk_expert_group_issue2(j->g,j->u,j->d,j->rows,j->n,j->x);
+    j->dt = now_s()-t0;
     return NULL;
 }
 #endif
@@ -3740,7 +3742,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             /* issue the SLOWER device first so it gets the longest overlap window;
              * dev2's submit runs on a worker thread (joined before take2 below) so its
              * per-block cost overlaps dev0 issue + the CPU share instead of serializing */
-            Vk2Iss iss2 = { vg2, vu2, vd2, vrows2, nvk2, vk_xh2, 0 };
+            Vk2Iss iss2 = { vg2, vu2, vd2, vrows2, nvk2, vk_xh2, 0, 0 };
             pthread_t iss2_th; int iss2_threaded=0;
             if(nvk2>0){
                 if(pthread_create(&iss2_th,NULL,vk2_issue_worker,&iss2)==0) iss2_threaded=1;
@@ -3802,7 +3804,8 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             }
             /* dev2 group: taken AFTER dev0's accumulate so the slower card gets the
              * extra overlap; same per-expert CPU recompute fallback on failure. */
-            if(iss2_threaded) pthread_join(iss2_th,NULL);
+            if(iss2_threaded){ double t_j0=now_s(); pthread_join(iss2_th,NULL);
+                if(g_prof){ g_vkb_join+=now_s()-t_j0; g_vkb_wrk+=iss2.dt; } }
             int vk2_ok = iss2.rc && coli_vk_expert_group_take2(vk_yh2);
             for(int c2=0;c2<nvk2;c2++){ int nr=vrows2[c2];
                 if(vk2_ok){ int o=voff2[c2];
@@ -5417,9 +5420,9 @@ static void profile_print(Model *m, double elapsed){
         elapsed-m->t_ewait-m->t_emm-m->t_attn-m->t_head-m->t_route-m->t_p2p:0);
 #ifdef COLI_VULKAN
     if(g_prof && g_vkb_blocks)
-        printf("VK-BLOCK: %lld blocks | avg nvk %.2f (dev2 %.2f) / ncpu %.2f | classify %.3fs | issue %.3fs | take+acc %.3fs (take-wait %.3fs) | cpu exec %.3fs wait %.3fs\n",
+        printf("VK-BLOCK: %lld blocks | avg nvk %.2f (dev2 %.2f) / ncpu %.2f | classify %.3fs | issue %.3fs | take+acc %.3fs (take-wait %.3fs) | d2-iss wrk %.3fs join %.3fs | cpu exec %.3fs wait %.3fs\n",
             (long long)g_vkb_blocks,(double)g_vkb_nvk/g_vkb_blocks,(double)g_vkb_nvk2/g_vkb_blocks,(double)g_vkb_ncpu/g_vkb_blocks,
-            g_vkb_cls,g_vkb_issue,g_vkb_acc,m->t_egpu,m->t_ecpu,m->t_ewait);
+            g_vkb_cls,g_vkb_issue,g_vkb_acc,m->t_egpu,g_vkb_wrk,g_vkb_join,m->t_ecpu,m->t_ewait);
 #endif
     if(g_mirror){
         double br[MIR_REPS]={0}, bt=0;
@@ -5449,7 +5452,7 @@ static void profile_reset(Model *m){
     m->t_ecpu=m->t_egpu=m->t_route=m->t_p2p=0;m->n_p2p=0;
     m->cpu_expert_bytes=0;m->cpu_expert_rows=0;
 #ifdef COLI_VULKAN
-    g_vkb_cls=g_vkb_issue=g_vkb_acc=0; g_vkb_blocks=g_vkb_nvk=g_vkb_nvk2=g_vkb_ncpu=0;
+    g_vkb_cls=g_vkb_issue=g_vkb_acc=g_vkb_wrk=g_vkb_join=0; g_vkb_blocks=g_vkb_nvk=g_vkb_nvk2=g_vkb_ncpu=0;
 #endif
     m->t_aproj=m->t_acore=m->t_aout=0;
     atomic_store_explicit(&g_edisk_ns,0,memory_order_relaxed);
