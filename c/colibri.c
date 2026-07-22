@@ -82,6 +82,16 @@ static const int *g_pre_idx; static const float *g_pre_w; static const int *g_pr
 #include <mach/mach.h>                            /* host_statistics64: MemAvailable di macOS */
 #endif
 
+/* Architecture family. ARCH_GLM = the original DeepSeek/GLM MLA + noaux_tc line the
+ * engine was built around. ARCH_M3 = MiniMax-M3 (minimax_m3_vl text model): standard
+ * GQA attention (per-head Gemma QK-norm before a split-half partial RoPE), Gemma-style
+ * RMSNorms (x*(1+w)), swigluoai activation, and the SAME router math as GLM (sigmoid +
+ * e_score_correction_bias choice, renormalized raw-sigmoid weights, routed scaling).
+ * For M3 the MLA cache aliases carry GQA rows: Lc = K rows, Rc = V rows, both
+ * n_kv_heads*head_dim wide (kv_lora/qk_rope are set to that stride at load). */
+#define ARCH_GLM 0
+#define ARCH_M3  1
+
 typedef struct {
     int hidden, n_layers, n_heads, n_experts, topk, moe_inter, dense_inter;
     int first_dense, q_lora, kv_lora, qk_nope, qk_rope, qk_head, v_head, n_shared, vocab;
@@ -90,6 +100,10 @@ typedef struct {
     int index_topk, index_nh, index_hd;          /* DSA lightning indexer */
     int8_t idx_type[128];                        /* per layer: 1=full (calcola), 0=shared (riusa) */
     float eps, theta, attn_scale, routed_scale;
+    int arch;                                    /* ARCH_GLM | ARCH_M3 */
+    int n_kv_heads, head_dim, rotary;            /* M3: GQA KV heads, head dim, partial-rope dims */
+    int shared_inter;                            /* M3: shared-expert intermediate (GLM: moe_inter*n_shared) */
+    float swiglu_alpha, swiglu_limit;            /* M3: swigluoai parameters */
 } Cfg;
 
 /* tensore [O,I] in uno di tre formati:
@@ -138,6 +152,8 @@ typedef struct {
     float *in_ln, *post_ln;
     /* MLA (densa, quantizzata) */
     QT q_a, q_b, kv_a, kv_b, o; float *q_a_ln, *kv_a_ln;
+    /* GQA (ARCH_M3): plain projections + per-head QK-norm weights [head_dim] */
+    QT q_p, k_p, v_p; float *q_hn, *k_hn;
 #ifdef COLI_CUDA
     ColiCudaTensor *kv_b_shard[COLI_CUDA_MAX_DEVICES];
     int shard_h0[COLI_CUDA_MAX_DEVICES],shard_hn[COLI_CUDA_MAX_DEVICES],n_kv_b_shard;
@@ -883,9 +899,16 @@ static void qt_fill(QT *t, const float *w, int bits){
     else pack_int4(w, t->q4, t->s, t->O, t->I, bits);
 }
 
+/* ARCH_M3 numeric conventions, set once at model_init from the config. Both default
+ * to the GLM behavior so every existing path is bit-identical when they stay 0. */
+static int g_gemma_norm=0;                        /* rmsnorm scales by (1+w) instead of w */
+static int g_act_swigluoai=0;                     /* glu = clamp+alpha-sigmoid, (up+1)*glu */
+static float g_swiglu_alpha=1.702f, g_swiglu_limit=7.0f;
 static void rmsnorm(float *out, const float *x, const float *w, int D, float eps){
     double ms=0; for(int i=0;i<D;i++) ms+=(double)x[i]*x[i];
-    float r=1.f/sqrtf((float)(ms/D)+eps); for(int i=0;i<D;i++) out[i]=x[i]*r*w[i];
+    float r=1.f/sqrtf((float)(ms/D)+eps);
+    const float wo = g_gemma_norm ? 1.f : 0.f;    /* Gemma-style: weight stored as (scale-1) */
+    for(int i=0;i<D;i++) out[i]=x[i]*r*(w[i]+wo);
 }
 /* LayerNorm classica (media+varianza, weight+bias) — usata dal k_norm dell'indexer DSA */
 static void layernorm(float *v, const float *w, const float *b, int n, float eps){
@@ -898,6 +921,19 @@ static void softmax(float *x,int n){ float m=-1e30f; for(int i=0;i<n;i++) if(x[i
     float s=0; for(int i=0;i<n;i++){x[i]=expf(x[i]-m);s+=x[i];} for(int i=0;i<n;i++) x[i]/=s; }
 static inline float sigmoidf(float x){ return 1.f/(1.f+expf(-x)); }
 static inline float siluf(float x){ return x/(1.f+expf(-x)); }
+/* GLU combine for the MLP/expert paths, in place into g: silu(g)*u by default,
+ * or swigluoai (MiniMax-M3 / GPT-OSS style) when g_act_swigluoai is set:
+ *   gate = min(g, limit); up = clamp(u, -limit, limit);
+ *   glu = gate * sigmoid(alpha*gate); out = (up + 1) * glu     (note the +1) */
+static inline void act_glu(float *g, const float *u, int64_t n){
+    if(!g_act_swigluoai){ for(int64_t i=0;i<n;i++) g[i]=siluf(g[i])*u[i]; return; }
+    const float A=g_swiglu_alpha, L=g_swiglu_limit;
+    for(int64_t i=0;i<n;i++){
+        float gv=g[i]<L?g[i]:L;
+        float uv=u[i]<-L?-L:(u[i]>L?L:u[i]);
+        g[i]=(uv+1.f)*(gv/(1.f+expf(-A*gv)));
+    }
+}
 
 /* RoPE interleaved su un vettore di dimensione qk_rope a posizione pos */
 static void rope_interleave(float *v, int pos, const Cfg *c){
@@ -955,6 +991,8 @@ static jval* cfg_root(const char *snap, char **arena){
 static int gi(jval*r,const char*k){ jval*v=json_get(r,k); return v?(int)v->num:0; }
 static void load_cfg(Cfg *c, const char *snap){
     char *ar=NULL; jval *r=cfg_root(snap,&ar);
+    { jval *mt=json_get(r,"model_type");
+      c->arch = (mt && mt->str && !strncmp(mt->str,"minimax",7)) ? ARCH_M3 : ARCH_GLM; }
     c->hidden=gi(r,"hidden_size"); c->n_layers=gi(r,"num_hidden_layers");
     c->n_heads=gi(r,"num_attention_heads"); c->n_experts=gi(r,"n_routed_experts");
     c->topk=gi(r,"num_experts_per_tok"); c->moe_inter=gi(r,"moe_intermediate_size");
@@ -967,7 +1005,32 @@ static void load_cfg(Cfg *c, const char *snap){
     jval *ep=json_get(r,"rms_norm_eps"); c->eps=ep?(float)ep->num:1e-5f;
     jval *rs=json_get(r,"routed_scaling_factor"); c->routed_scale=rs?(float)rs->num:1.f;
     jval *rp=json_get(r,"rope_parameters"); jval *th=rp?json_get(rp,"rope_theta"):NULL;
+    if(!th) th=json_get(r,"rope_theta");         /* M3 (and some GLM configs): flat key */
     c->theta = th?(float)th->num:10000.f;
+    if(c->arch==ARCH_M3){
+        /* MiniMax-M3 key names (flattened text_config, see tools/convert --arch m3).
+         * intermediate_size IS the routed-expert width there; the first-3-dense
+         * pattern arrives as a moe_layer_freq 0/1 array (count the leading zeros). */
+        c->n_experts=gi(r,"num_local_experts");
+        c->moe_inter=gi(r,"intermediate_size");
+        c->dense_inter=gi(r,"dense_intermediate_size");
+        c->shared_inter=gi(r,"shared_intermediate_size");
+        if(!c->shared_inter) c->shared_inter=c->moe_inter*(c->n_shared?c->n_shared:1);
+        c->n_kv_heads=gi(r,"num_key_value_heads");
+        c->head_dim=gi(r,"head_dim");
+        c->rotary=gi(r,"rotary_dim");
+        { jval *sa=json_get(r,"swiglu_alpha"); c->swiglu_alpha=sa?(float)sa->num:1.702f;
+          jval *sl=json_get(r,"swiglu_limit"); c->swiglu_limit=sl?(float)sl->num:7.0f; }
+        { jval *fr=json_get(r,"moe_layer_freq"); c->first_dense=0;
+          if(fr && fr->t==J_ARR){ int i=0; while(i<fr->len && (int)fr->kids[i]->num==0) i++;
+                                  c->first_dense=i; } }
+        c->norm_topk=1;                          /* M3 always renormalizes the top-k weights */
+        c->n_group=1;                            /* no grouped routing (key absent -> 0) */
+        /* GQA rows ride the MLA cache aliases: Lc rows = K (n_kv*hd), Rc rows = V. */
+        c->kv_lora = c->n_kv_heads*c->head_dim;
+        c->qk_rope = c->n_kv_heads*c->head_dim;
+        c->qk_nope=0; c->v_head=c->head_dim; c->q_lora=0;
+    }
     /* token di stop: GLM-5.2 ne ha TRE (endoftext, user, observation). Fermarsi solo sul
      * primo = generare spazzatura invisibile dopo la fine del turno (5-10x token sprecati). */
     c->n_stop=0;
@@ -1015,8 +1078,13 @@ static void load_cfg(Cfg *c, const char *snap){
               c->idx_type[i] = !strcmp(it->kids[i]->str,"full");
           else { int v=i-off+1; if(v<0) v=0; c->idx_type[i] = (v%freq)==0; }
       } }
-    c->qk_head=c->qk_nope+c->qk_rope;
-    c->attn_scale = 1.f / sqrtf((float)c->qk_head);
+    if(c->arch==ARCH_M3){
+        c->qk_head=c->head_dim;
+        c->attn_scale = 1.f / sqrtf((float)c->head_dim);
+    } else {
+        c->qk_head=c->qk_nope+c->qk_rope;
+        c->attn_scale = 1.f / sqrtf((float)c->qk_head);
+    }
     if(c->n_group!=1){ fprintf(stderr,"this engine requires n_group=1 (GLM-5.2)\n"); exit(1); }
     /* VALIDAZIONE (report PR #25): il config.json arriva da mirror non fidati — dimensioni
      * ostili non devono superare questo punto. Un solo choke point protegge ogni alloc a valle. */
@@ -1026,11 +1094,18 @@ static void load_cfg(Cfg *c, const char *snap){
     CKR("num_attention_heads",c->n_heads,1,1024) CKR("n_routed_experts",c->n_experts,1,4096)
     CKR("num_experts_per_tok",c->topk,1,64)      CKR("moe_intermediate_size",c->moe_inter,1,1<<20)
     CKR("intermediate_size",c->dense_inter,1,1<<24) CKR("first_k_dense_replace",c->first_dense,0,c->n_layers)
+    CKR("n_shared_experts",c->n_shared,0,64)     CKR("vocab_size",c->vocab,1,1<<24)
+    if(c->arch==ARCH_M3){
+    CKR("num_key_value_heads",c->n_kv_heads,1,c->n_heads)
+    CKR("head_dim",c->head_dim,1,1<<16)          CKR("rotary_dim",c->rotary,0,c->head_dim)
+    if(c->n_heads % c->n_kv_heads){ fprintf(stderr,"config: num_attention_heads %% num_key_value_heads != 0\n"); exit(1); }
+    if(c->rotary % 2){ fprintf(stderr,"config: rotary_dim must be even\n"); exit(1); }
+    } else {
     CKR("q_lora_rank",c->q_lora,0,1<<20)         CKR("kv_lora_rank",c->kv_lora,1,1<<20)
     CKR("qk_nope_head_dim",c->qk_nope,1,1<<16)   CKR("qk_rope_head_dim",c->qk_rope,1,1<<16)
-    CKR("v_head_dim",c->v_head,1,1<<16)          CKR("n_shared_experts",c->n_shared,0,64)
-    CKR("vocab_size",c->vocab,1,1<<24)           CKR("index_topk",c->index_topk,0,1<<20)
+    CKR("v_head_dim",c->v_head,1,1<<16)          CKR("index_topk",c->index_topk,0,1<<20)
     CKR("index_n_heads",c->index_nh,0,1024)      CKR("index_head_dim",c->index_hd,0,1<<16)
+    }
     #undef CKR
     free(ar);
 }
@@ -1177,6 +1252,13 @@ static void layer_cuda_shard_kvb(Layer *l,int H,int Q,int V){
 static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits){
     memset(m,0,sizeof(*m)); m->ebits=ebits; m->dbits=dbits;
     load_cfg(&m->c,snap);
+    if(m->c.arch==ARCH_M3){
+        g_gemma_norm=1; g_act_swigluoai=1;
+        g_swiglu_alpha=m->c.swiglu_alpha; g_swiglu_limit=m->c.swiglu_limit;
+        fprintf(stderr,"[ARCH] MiniMax-M3: GQA %d/%d heads hd %d, rotary %d, %d experts top-%d, "
+                       "gemma-norm + swigluoai\n", m->c.n_heads, m->c.n_kv_heads, m->c.head_dim,
+                       m->c.rotary, m->c.n_experts, m->c.topk);
+    }
     { const char *xd=getenv("COLI_MODEL_DIRS");        /* SPLIT: model shards spread across N drives */
       st_init_multi(&m->S,snap,(xd&&*xd)?xd:NULL); }
     Cfg *c=&m->c; char nm[256]; int H=c->n_heads, D=c->hidden;
@@ -1206,6 +1288,14 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
         #define P(s) (snprintf(nm,sizeof(nm),"model.layers.%d." s,i),nm)
         l->in_ln=ld(m,P("input_layernorm.weight"));
         l->post_ln=ld(m,P("post_attention_layernorm.weight"));
+        if(c->arch==ARCH_M3){
+        l->q_p   = qt_load(m,P("self_attn.q_proj.weight"), H*c->head_dim, D, dbits);
+        l->k_p   = qt_load(m,P("self_attn.k_proj.weight"), c->n_kv_heads*c->head_dim, D, dbits);
+        l->v_p   = qt_load(m,P("self_attn.v_proj.weight"), c->n_kv_heads*c->head_dim, D, dbits);
+        l->o     = qt_load(m,P("self_attn.o_proj.weight"), D, H*c->head_dim, dbits);
+        l->q_hn  = ld(m,P("self_attn.q_norm.weight"));
+        l->k_hn  = ld(m,P("self_attn.k_norm.weight"));
+        } else {
         l->q_a   = qt_load(m,P("self_attn.q_a_proj.weight"), c->q_lora, D, dbits);
         l->q_a_ln= ld(m,P("self_attn.q_a_layernorm.weight"));
         l->q_b   = qt_load(m,P("self_attn.q_b_proj.weight"), H*c->qk_head, c->q_lora, dbits);
@@ -1213,6 +1303,7 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
         l->kv_a_ln= ld(m,P("self_attn.kv_a_layernorm.weight"));
         l->kv_b  = qt_load(m,P("self_attn.kv_b_proj.weight"), H*(c->qk_nope+c->v_head), c->kv_lora, dbits);
         l->o     = qt_load(m,P("self_attn.o_proj.weight"), D, H*c->v_head, dbits);
+        }
 #ifdef COLI_CUDA
         qt_cuda_colocate(&l->o,&l->kv_b);
         qt_cuda_colocate(&l->q_a,&l->kv_b);   /* PIPE: intera catena attention sulla */
@@ -1229,7 +1320,7 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
         } else {
             l->router=ld(m,P("mlp.gate.weight"));
             l->router_bias=ld(m,P("mlp.gate.e_score_correction_bias"));
-            int sI=c->moe_inter*c->n_shared;
+            int sI = c->arch==ARCH_M3 ? c->shared_inter : c->moe_inter*c->n_shared;
             l->sh_gate = qt_load(m,P("mlp.shared_experts.gate_proj.weight"), sI, D, dbits);
             l->sh_up   = qt_load(m,P("mlp.shared_experts.up_proj.weight"),   sI, D, dbits);
             l->sh_down = qt_load(m,P("mlp.shared_experts.down_proj.weight"), D, sI, dbits);
@@ -2494,10 +2585,99 @@ done:
 }
 #endif
 
+/* ---------------- ARCH_M3: standard GQA attention --------------------------------
+ * MiniMax-M3 text backbone (transformers modeling_minimax_m3_vl conventions):
+ * per-head Gemma RMSNorm (x*(1+w), eps=rms_norm_eps) on Q and K BEFORE RoPE; partial
+ * split-half (NEOX) RoPE on the first c->rotary dims of each head; standard per-token
+ * KV rows in the Lc/Rc aliases (K = Lc, V = Rc, both n_kv_heads*head_dim wide — set
+ * up by load_cfg); score/softmax/value with H/n_kv_heads query heads per KV head;
+ * o_proj at the end. Mirrors attention_rows' ragged contract (kvs/positions per-row
+ * KV target, else pos_base+s). MSA block selection is NOT implemented: full causal
+ * attention — EXACT for windows up to sparse_topk_blocks*block = 2048 tokens (the
+ * indexer selects every block then), an approximation beyond. */
+static void rope_half_neox(float *v, int rot, int pos, float theta){
+    int h2=rot/2;
+    for(int j=0;j<h2;j++){
+        float fr=powf(theta, -2.f*(float)j/(float)rot);
+        float ang=(float)pos*fr, cs=cosf(ang), sn=sinf(ang);
+        float x1=v[j], x2=v[j+h2];
+        v[j]   =x1*cs-x2*sn;
+        v[j+h2]=x2*cs+x1*sn;
+    }
+}
+static void rms_head_g(float *v, const float *w, int n, float eps){  /* per-head Gemma norm */
+    double ms=0; for(int i=0;i<n;i++) ms+=(double)v[i]*v[i];
+    float r=1.f/sqrtf((float)(ms/n)+eps);
+    for(int i=0;i<n;i++) v[i]=v[i]*r*(w[i]+1.f);
+}
+static void attention_gqa(Model *m, Layer *l, int layer, float *x, int S, int pos_base,
+                          KVState *const *kvs, const int *positions, float *out){
+    Cfg *c=&m->c; int H=c->n_heads, NK=c->n_kv_heads, hd=c->head_dim;
+    int G=H/NK, KVd=NK*hd, rot=c->rotary;
+    double ta0=now_s();
+    float *q=falloc((int64_t)S*H*hd), *k=falloc((int64_t)S*KVd), *v=falloc((int64_t)S*KVd);
+    float *ctx=falloc((int64_t)S*H*hd);
+    double tp0=now_s();
+    matmul_qt(q,x,&l->q_p,S);
+    matmul_qt(k,x,&l->k_p,S);
+    matmul_qt(v,x,&l->v_p,S);
+    m->t_aproj+=now_s()-tp0;
+    for(int s=0;s<S;s++){                        /* norm+rope, then mirror into the cache */
+        KVState *ks=kvs?kvs[s]:m->kv;
+        int pos=positions?positions[s]:pos_base+s;
+        float *qs=q+(int64_t)s*H*hd, *ksr=k+(int64_t)s*KVd, *vsr=v+(int64_t)s*KVd;
+        for(int h=0;h<H;h++){ float *qh=qs+(int64_t)h*hd;
+            rms_head_g(qh,l->q_hn,hd,c->eps); rope_half_neox(qh,rot,pos,c->theta); }
+        for(int h=0;h<NK;h++){ float *kh=ksr+(int64_t)h*hd;
+            rms_head_g(kh,l->k_hn,hd,c->eps); rope_half_neox(kh,rot,pos,c->theta); }
+        memcpy(ks->Lc[layer]+(int64_t)pos*KVd, ksr, (size_t)KVd*sizeof(float));
+        memcpy(ks->Rc[layer]+(int64_t)pos*KVd, vsr, (size_t)KVd*sizeof(float));
+    }
+    double tc0=now_s();
+    for(int s=0;s<S;s++){
+        KVState *ks=kvs?kvs[s]:m->kv;
+        int pos=positions?positions[s]:pos_base+s;
+        int st0=ks->kv_start[layer], T=pos+1, win=T-st0;
+        const float *K0=ks->Lc[layer], *V0=ks->Rc[layer];
+        float *qs=q+(int64_t)s*H*hd, *cs=ctx+(int64_t)s*H*hd;
+        float *att=falloc((int64_t)H*win);
+        #pragma omp parallel for schedule(static)
+        for(int h=0;h<H;h++){
+            const float *qh=qs+(int64_t)h*hd;
+            int g=h/G;                           /* repeat_kv: query head h reads KV head h/G */
+            float *ah=att+(int64_t)h*win;
+            float mx=-1e30f;
+            for(int t=st0;t<T;t++){
+                const float *kr=K0+(int64_t)t*KVd+(int64_t)g*hd;
+                float d=0; for(int i=0;i<hd;i++) d+=qh[i]*kr[i];
+                d*=c->attn_scale; ah[t-st0]=d; if(d>mx) mx=d;
+            }
+            float ssum=0;
+            for(int t=0;t<win;t++){ ah[t]=expf(ah[t]-mx); ssum+=ah[t]; }
+            float inv=1.f/ssum;
+            float *ch=cs+(int64_t)h*hd;
+            for(int i=0;i<hd;i++) ch[i]=0.f;
+            for(int t=st0;t<T;t++){
+                const float *vr=V0+(int64_t)t*KVd+(int64_t)g*hd;
+                float a=ah[t-st0]*inv;
+                for(int i=0;i<hd;i++) ch[i]+=a*vr[i];
+            }
+        }
+        free(att);
+    }
+    m->t_acore+=now_s()-tc0;
+    double to0=now_s();
+    matmul_qt(out,ctx,&l->o,S);
+    m->t_aout+=now_s()-to0;
+    free(q); free(k); free(v); free(ctx);
+    m->t_attn += now_s()-ta0;
+}
+
 static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int pos_base,
                            KVState *const *kvs, const int *positions, float *out){
     Cfg *c=&m->c; int H=c->n_heads, D=c->hidden, qh=c->qk_head, vh=c->v_head;
     int kvb_dim=H*(c->qk_nope+vh), Tk=pos_base+S;
+    if(c->arch==ARCH_M3){ attention_gqa(m,l,layer,x,S,pos_base,kvs,positions,out); return; }
     double ta0=now_s();
 #ifdef COLI_METAL
     /* Fused decode attention on GPU: whole layer in one command buffer (keeps the GPU hot).
@@ -3674,7 +3854,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                             float *gj=GG+(int64_t)j*I, *uj=UU+(int64_t)j*I;
                             for(int o=c0;o<c1;o++) gj[o]=(float)dot_i4i8(qg+(int64_t)o*rbD,xq8,D)*e->g.s[o]*sx0;
                             for(int o=c0;o<c1;o++) uj[o]=(float)dot_i4i8(qu+(int64_t)o*rbD,xq8,D)*e->u.s[o]*sx0;
-                            for(int o=c0;o<c1;o++) gj[o]=siluf(gj[o])*uj[o];
+                            act_glu(gj+c0, uj+c0, c1-c0);
                         }                              /* implicit barrier */
                         #pragma omp for schedule(static)
                         for(int j=0;j<nb;j++) gsc[j]=qrow_i8(GG+(int64_t)j*I, GQ+(int64_t)j*I, I);
@@ -3775,7 +3955,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                     for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D, x+(int64_t)crmap[c2*S+r]*D, D*sizeof(float));
                     double te0=now_s();
                     expert_gate_up(gg,uu,xg,&e->g,&e->u,nr);
-                    for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
+                    act_glu(gg, uu, (int64_t)nr*I);
                     matmul_qt(hh, gg, &e->d, nr);
                     for(int r=0;r<nr;r++){ float *os=out+(int64_t)crmap[c2*S+r]*D, wgt=cwmap[c2*S+r], *hr=hh+(int64_t)r*D;
                         for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
@@ -3796,7 +3976,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                     if(e->eid!=veid[c2] || !e->slab) expert_load(m,layer,veid[c2],e,1,0);   /* device-lost recovery: DISK-CLASS leaves it unclassified */
                     for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D, x+(int64_t)vrmap[c2*S+r]*D, D*sizeof(float));
                     expert_gate_up(gg,uu,xg,&e->g,&e->u,nr);
-                    for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
+                    act_glu(gg, uu, (int64_t)nr*I);
                     matmul_qt(hh, gg, &e->d, nr);
                     for(int r=0;r<nr;r++){ float *os=out+(int64_t)vrmap[c2*S+r]*D, wgt=vwmap[c2*S+r], *hr=hh+(int64_t)r*D;
                         for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
@@ -3816,7 +3996,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                     if(e->eid!=veid2[c2] || !e->slab) expert_load(m,layer,veid2[c2],e,1,0);
                     for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D, x+(int64_t)vrmap2[c2*S+r]*D, D*sizeof(float));
                     expert_gate_up(gg,uu,xg,&e->g,&e->u,nr);
-                    for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
+                    act_glu(gg, uu, (int64_t)nr*I);
                     matmul_qt(hh, gg, &e->d, nr);
                     for(int r=0;r<nr;r++){ float *os=out+(int64_t)vrmap2[c2*S+r]*D, wgt=vwmap2[c2*S+r], *hr=hh+(int64_t)r*D;
                         for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
@@ -3873,7 +4053,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             if(!e->slab) expert_host_ensure(m,layer,e);
 #endif
             expert_gate_up(gg,uu,xg,&e->g,&e->u,nr);
-            for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
+            act_glu(gg, uu, (int64_t)nr*I);
             if(e->d.fmt==6) e8_rot_rows(gg,nr,I);   /* down input is per-expert — rotate here */
             matmul_qt(hh, gg, &e->d, nr);
             for(int r=0;r<nr;r++){ float *os=out+(int64_t)rows[r]*D, wgt=rw[r], *hr=hh+(int64_t)r*D;
@@ -3903,7 +4083,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                         for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D,x+(int64_t)eg_row[gi][r]*D,D*sizeof(float));
                         expert_host_ensure(m,layer,e);
                         expert_gate_up(gg,uu,xg,&e->g,&e->u,nr);
-                        for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
+                        act_glu(gg, uu, (int64_t)nr*I);
                         matmul_qt(hh,gg,&e->d,nr);
                         for(int r=0;r<nr;r++){ float *os=out+(int64_t)eg_row[gi][r]*D; float wgt=eg_w[gi][r];
                             for(int d=0;d<D;d++) os[d]+=wgt*hh[(int64_t)r*D+d]; }
@@ -4002,7 +4182,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                     if(!coli_cuda_expert_mlp(e->g.cuda,e->u.cuda,e->d.cuda,hh,xg,nr)){
                         expert_host_ensure(m,layer,e);
                         expert_gate_up(gg,uu,xg,&e->g,&e->u,nr);
-                        for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
+                        act_glu(gg, uu, (int64_t)nr*I);
                         matmul_qt(hh,gg,&e->d,nr);
                         if(g_prof){m->cpu_expert_bytes+=qt_bytes(&e->g)+qt_bytes(&e->u)+qt_bytes(&e->d);
                             m->cpu_expert_rows+=(uint64_t)nr;}
@@ -4057,8 +4237,8 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
          * via the expert-group primitive with count=1 — replaces 3 separate VK matmuls
          * (x read once, 1 fence instead of 3). Falls through to the per-matmul chain. */
         int fsh=l->sh_gate.fmt;
-        if(g_vk_dense && !omp_in_parallel() && (fsh==1||fsh==2||fsh==5) &&
-           l->sh_up.fmt==fsh && l->sh_down.fmt==fsh){
+        if(g_vk_dense && !g_act_swigluoai && !omp_in_parallel() && (fsh==1||fsh==2||fsh==5) &&
+           l->sh_up.fmt==fsh && l->sh_down.fmt==fsh){   /* fused shader hardcodes silu — M3 uses the per-matmul chain */
             #define SW_(t) ((t).fmt==1?(const void*)(t).q8:(const void*)(t).q4)
             if(coli_vk_tensor_ensure(&l->sh_gate.vk,SW_(l->sh_gate),l->sh_gate.s,fsh,D,sI,l->sh_gate.gs)&&
                coli_vk_tensor_ensure(&l->sh_up.vk,  SW_(l->sh_up),  l->sh_up.s,  fsh,D,sI,l->sh_up.gs)&&
@@ -4080,7 +4260,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
         if(!vk_matmul_qt(&l->sh_up, su, x, S))
 #endif
         matmul_qt(su, x, &l->sh_up,   S);
-        for(int64_t z=0;z<(int64_t)S*sI;z++) sg[z]=siluf(sg[z])*su[z];
+        act_glu(sg, su, (int64_t)S*sI);
 #ifdef COLI_VULKAN
         if(!vk_matmul_qt(&l->sh_down, hh, sg, S))
 #endif
@@ -4108,7 +4288,7 @@ static void dense_mlp(Layer *l, float *x, int S, int D, int I, float *out){
     float *g=falloc((int64_t)S*I), *u=falloc((int64_t)S*I);
     matmul_qt(g, x, &l->gate_proj, S);
     matmul_qt(u, x, &l->up_proj,   S);
-    for(int64_t i=0;i<(int64_t)S*I;i++) g[i]=siluf(g[i])*u[i];
+    act_glu(g, u, (int64_t)S*I);
     matmul_qt(out, g, &l->down_proj, S);
     free(g); free(u);
 }
@@ -4144,7 +4324,7 @@ static void la_predict(Model *m, int target, const float *h, int kind){
         rmsnorm(snrm, h, sl->post_ln, D, c->eps);
         matmul_qt(sg, snrm, &sl->sh_gate, 1);
         matmul_qt(su, snrm, &sl->sh_up,   1);
-        for(int i=0;i<sI;i++) sg[i] = siluf(sg[i]) * su[i];
+        act_glu(sg, su, sI);
         matmul_qt(sout, sg, &sl->sh_down, 1);
         for(int i=0;i<D;i++) hc[i] = h[i] + sout[i];
         rmsnorm(nrm, hc, l->post_ln, D, c->eps);
@@ -4499,7 +4679,7 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S){
             rmsnorm(snrm, xs, sl->post_ln, D, c->eps);
             matmul_qt(sg, snrm, &sl->sh_gate, 1);
             matmul_qt(su, snrm, &sl->sh_up,   1);
-            for(int i=0;i<sI;i++) sg[i] = siluf(sg[i]) * su[i];
+            act_glu(sg, su, sI);
             matmul_qt(sout, sg, &sl->sh_down, 1);
             for(int i=0;i<D;i++) hc[i] = xs[i] + sout[i];
             rmsnorm(nrm, hc, l->post_ln, D, c->eps);
@@ -6346,6 +6526,7 @@ static void run_serve(Model *m, const char *snap){
     char tkp[2048]; snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
     Tok T; tok_load(&T,tkp);
     int eos=tok_id_of(&T,"<|endoftext|>");
+    if(eos<0) eos=tok_id_of(&T,"[e~[");          /* MiniMax-M3 end-of-sequence */
     stops_arm_tok(&m->c, eos, &T);
     grammar_setup(&g_grd,&T);                   /* metodo F: GRAMMAR=file.gbnf (#48) */
     if(g_temp<0) g_temp=0.7f;            /* auto: 0.7, NON l'1.0 ufficiale — la coda della
@@ -6422,8 +6603,13 @@ static void run_serve(Model *m, const char *snap){
         int bl=0, k=0;                           /* costruisce/tokenizza il turno */
         /* template UFFICIALE GLM-5.2 (chat_template.jinja): niente \n dopo i ruoli, e dopo
          * <|assistant|> serve SEMPRE il blocco think — <think></think> lo DISATTIVA (nothink):
-         * col template sbagliato il modello farfuglia e non emette mai lo stop. THINK=1 lo abilita. */
-        const char *tk = getenv("THINK")&&atoi(getenv("THINK"))? "<think>" : "<think></think>";
+         * col template sbagliato il modello farfuglia e non emette mai lo stop. THINK=1 lo abilita.
+         * MiniMax-M3 (chat_template.jinja): ]~!b[ once, then ]~b]<role>\n<content>[e~[\n blocks
+         * with roles user/ai; the ai turn opens bare (adaptive thinking) — THINK=0-style
+         * suppression prefixes the reply with </mm:think>, mirroring the official history form. */
+        int think_on = getenv("THINK")&&atoi(getenv("THINK"));
+        const char *tk = m->c.arch==ARCH_M3 ? (think_on? "" : "</mm:think>")
+                                            : (think_on? "<think>" : "<think></think>");
         if(raw_mode){
             int *tmp=malloc(maxctx*sizeof(int)); if(!tmp){fprintf(stderr,"OOM raw tokens\n");exit(1);}
             prompt_tokens=tok_encode(&T,input,input_n,tmp,maxctx-8-g_draft);
@@ -6440,12 +6626,19 @@ static void run_serve(Model *m, const char *snap){
                 active,len,prompt_tokens,k);
             free(tmp);
         } else {
-            if(templ){ if(first) bl+=snprintf(buf+bl,(1<<16)-bl,"[gMASK]<sop>");
-                       bl+=snprintf(buf+bl,(1<<16)-bl,"<|user|>%s<|assistant|>%s",input,tk); }
+            if(templ){ if(m->c.arch==ARCH_M3){
+                           if(first) bl+=snprintf(buf+bl,(1<<16)-bl,"]~!b[");
+                           bl+=snprintf(buf+bl,(1<<16)-bl,"]~b]user\n%s[e~[\n]~b]ai\n%s",input,tk);
+                       } else {
+                           if(first) bl+=snprintf(buf+bl,(1<<16)-bl,"[gMASK]<sop>");
+                           bl+=snprintf(buf+bl,(1<<16)-bl,"<|user|>%s<|assistant|>%s",input,tk);
+                       } }
             else bl+=snprintf(buf+bl,(1<<16)-bl,"%s",input);
             k=tok_encode(&T,buf,bl,hist+len,maxctx-len); prompt_tokens=k;
             if(len+k+8+g_draft>=maxctx){ len=0; first=1; kv_disk_reset(m);
-                bl=0; if(templ){ bl+=snprintf(buf+bl,(1<<16)-bl,"[gMASK]<sop><|user|>%s<|assistant|>%s",input,tk); }
+                bl=0; if(templ){ bl+=snprintf(buf+bl,(1<<16)-bl, m->c.arch==ARCH_M3
+                                   ? "]~!b[]~b]user\n%s[e~[\n]~b]ai\n%s"
+                                   : "[gMASK]<sop><|user|>%s<|assistant|>%s",input,tk); }
                 else bl+=snprintf(buf+bl,(1<<16)-bl,"%s",input);
                 k=tok_encode(&T,buf,bl,hist,maxctx); if(k>maxctx-8-g_draft) k=maxctx-8-g_draft;
                 prompt_tokens=k;
@@ -6555,6 +6748,11 @@ static void vk_dense_preload(Model *m){
 static void vk_registry_fill(Model *m){
     Cfg *c=&m->c; int E=c->n_experts, NL=c->n_layers;
     if(!g_vulkan || g_vk_budget<=0) return;
+    if(c->arch!=ARCH_GLM){                       /* expert-group shaders hardcode silu */
+        fprintf(stderr,"[VK] expert tier disabled for this architecture (shader activation "
+                       "is silu; swigluoai shader variant pending) — experts run on the CPU\n");
+        return;
+    }
     int64_t nz=0;
     for(int i=0;i<NL;i++) if(m->eusage[i]) for(int e=0;e<E;e++) if(m->eusage[i][e]) nz++;
     if(!nz){ fprintf(stderr,"[VK] expert tier: no usage history yet — tier empty this run "

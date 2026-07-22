@@ -517,11 +517,42 @@ def render_chat_inkling(messages, enable_thinking=False, reasoning_effort=None, 
     return "".join(prompt)
 
 
+def render_chat_m3(messages, enable_thinking=False):
+    """Text-only subset of the MiniMax-M3 chat template (chat_template.jinja):
+    ]~!b[ once, then ]~b]<role>\n<content>[e~[\n blocks. A client "system" message
+    maps to the `developer` role (the official template reserves `system` for the
+    auto-injected model-identity block, which we do not fabricate here). History
+    assistant turns carry the </mm:think> prefix; the open ai turn does too unless
+    thinking is enabled. Tool calls: not yet rendered for this family."""
+    prompt = ["]~!b["]
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            raise APIError(400, "Each message must be an object.", f"messages.{index}")
+        role = message.get("role")
+        raw = message.get("content")
+        text = content_text(raw, f"messages.{index}.content") if raw is not None else ""
+        if role in ("system", "developer"):
+            prompt.append(f"]~b]developer\n{text}[e~[\n")
+        elif role == "user":
+            prompt.append(f"]~b]user\n{text}[e~[\n")
+        elif role == "assistant":
+            prompt.append(f"]~b]ai\n</mm:think>{text.strip()}[e~[\n")
+        else:
+            raise APIError(400, f"Unsupported message role for MiniMax-M3: {role!r}.",
+                           f"messages.{index}.role", "unsupported_role")
+    prompt.append("]~b]ai\n" + ("" if enable_thinking else "</mm:think>"))
+    return "".join(prompt)
+
+
 def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=None,
                 tool_choice=None):
     """Render the text-only subset of the official GLM-5.2 chat template."""
     if not isinstance(messages, list) or not messages:
         raise APIError(400, "`messages` must be a non-empty array.", "messages")
+    if ARCH.startswith("minimax"):
+        if tools:
+            raise APIError(400, "tools are not yet supported for the MiniMax-M3 template.", "tools")
+        return render_chat_m3(messages, enable_thinking)
     prompt = ["[gMASK]<sop>"]
     if enable_thinking:
         effort = "High" if reasoning_effort == "high" else "Max"
@@ -2029,6 +2060,14 @@ class APIHandler(BaseHTTPRequestHandler):
 def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_key=None,
           cap=8, max_tokens=1024, engine=None, env=None, cors_origins=None,
           max_queue=8, queue_timeout=300, kv_slots=1):
+    global ARCH
+    try:
+        with open(os.path.join(str(model), "config.json")) as f:
+            mt = json.load(f).get("model_type") or ""
+        if mt.startswith("minimax"):
+            ARCH = mt                  # render_chat delegates to render_chat_m3
+    except (OSError, ValueError):
+        pass
     if engine is None:
         engine = default_engine()
     if not 1 <= max_tokens:
