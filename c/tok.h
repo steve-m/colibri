@@ -148,11 +148,22 @@ static void tok_load(Tok *T, const char *path){
     hm_init(&T->merges, mc);
     for(int i=0;i<merges->len;i++){
         jval *pr=merges->kids[i];
-        if(!pr||pr->t!=J_ARR||pr->len<2||!pr->kids[0]||!pr->kids[1]||
-           pr->kids[0]->t!=J_STR||pr->kids[1]->t!=J_STR){
-            fprintf(stderr,"tokenizer.json: malformed merge entry %d\n",i); exit(1); }
-        const char *l=pr->kids[0]->str, *r=pr->kids[1]->str;
-        int ll=(int)strlen(l), rl=(int)strlen(r);
+        const char *l, *r; int ll, rl;
+        if(pr && pr->t==J_ARR && pr->len>=2 && pr->kids[0] && pr->kids[1] &&
+           pr->kids[0]->t==J_STR && pr->kids[1]->t==J_STR){
+            l=pr->kids[0]->str; r=pr->kids[1]->str;           /* newer form: ["left","right"] (GLM) */
+            ll=(int)strlen(l); rl=(int)strlen(r);
+        }else if(pr && pr->t==J_STR && pr->str){
+            /* classic form: "left right" (MiniMax-M3, o200k-family). Byte-level BPE
+             * encodes spaces as U+0120 (Ġ), so a token never contains a literal space
+             * and the first space is unambiguously the pair separator. */
+            const char *sp=strchr(pr->str,' ');
+            if(!sp){ fprintf(stderr,"tokenizer.json: malformed merge entry %d\n",i); exit(1); }
+            l=pr->str; ll=(int)(sp-pr->str);
+            r=sp+1; rl=(int)strlen(r);
+        }else{
+            fprintf(stderr,"tokenizer.json: malformed merge entry %d\n",i); exit(1);
+        }
         char *key=malloc(ll+1+rl); memcpy(key,l,ll); key[ll]=0; memcpy(key+ll+1,r,rl);
         hm_put(&T->merges, key, ll+1+rl, i);
     }
