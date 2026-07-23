@@ -54,7 +54,7 @@ $(warning libomp not found: building single-threaded. For multithreading: brew i
 OMPC    =
 OMPL    =
 endif
-CFLAGS  = -O3 $(OMPC) -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
+CFLAGS  = -O3 $(OMPC) -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function -Wno-missing-field-initializers
 # Opt-in: ARCH=native appends -mcpu=native (arm64 clang uses -mcpu, not -march),
 # which unlocks the i8mm SMMLA int8/int4 dot kernels in colibri.c. ARCH unset ->
 # no -mcpu, default build byte-identical. Apple clang knows apple-m4 / native.
@@ -79,7 +79,7 @@ else ifneq ($(IS_WIN),)
 # a v3 build simply compiles out the VNNI path - safe on any x86-64.
 CC      = gcc
 ARCH   ?= x86-64-v3
-CFLAGS  = -D_FILE_OFFSET_BITS=64 -O3 -march=$(ARCH) -fopenmp -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
+CFLAGS  = -D_FILE_OFFSET_BITS=64 -O3 -march=$(ARCH) -fopenmp -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function -Wno-missing-field-initializers
 # -lpsapi: compat.h calls GetProcessMemoryInfo (rss_gb). It's linked via
 # #pragma comment(lib,"psapi.lib") for MSVC, but MinGW gcc ignores that pragma
 # (warns), so link psapi explicitly or the build fails undefined-reference on
@@ -94,7 +94,7 @@ ifneq (,$(PPC64))
 # (validated token-exact vs the transformers oracle on a POWER8 S824).
 CC      = gcc
 ARCH   ?= native
-CFLAGS  = -O3 -mcpu=$(ARCH) -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
+CFLAGS  = -O3 -mcpu=$(ARCH) -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function -Wno-missing-field-initializers
 LDFLAGS = -lm -fopenmp -pthread
 EXE     =
 else
@@ -105,7 +105,7 @@ CC      = gcc
 # ARCH=x86-64 -> massima compatibilita' (niente AVX2: usa il path scalare di fallback).
 # -pthread: Linux lo tira dentro via -fopenmp, i *BSD no e le pthread_* non risolvono (#219).
 ARCH   ?= native
-CFLAGS  = -O3 -march=$(ARCH) -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
+CFLAGS  = -O3 -march=$(ARCH) -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function -Wno-missing-field-initializers
 LDFLAGS = -lm -fopenmp -pthread
 EXE     =
 endif
@@ -270,7 +270,7 @@ ifeq ($(VK),1)
 CFLAGS   += -DCOLI_VULKAN
 LDFLAGS  += -lvulkan
 VK_OBJ    = backend_vulkan.o
-VK_SPV    = shaders/qmatmul.spv shaders/qmatmul_gate_up.spv shaders/attention_absorb.spv shaders/rmsnorm.spv
+VK_SPV    = shaders/qmatmul.spv shaders/qmatmul_gate_up.spv shaders/attention_absorb.spv shaders/attention_gqa.spv shaders/rmsnorm.spv
 endif
 
 all: colibri$(EXE)
