@@ -1,6 +1,7 @@
 /* kv_persist.h — .coli_kv on-disk KV cache persistence.
- * Conversations reopen warm across engine restarts: the compressed MLA KV-cache
- * is appended incrementally after every turn, crash-safe (nrec written last).
+ * Conversations reopen warm across engine restarts: the KV cache (MLA rows, or
+ * GQA K/V riding the same aliases) plus the DSA/MSA index-key cache Ic is
+ * appended incrementally after every turn, crash-safe (nrec written last).
  * Include after Model/KVState/Cfg are defined; requires now_s() and g_draft. */
 #ifndef KV_PERSIST_H
 #define KV_PERSIST_H
@@ -12,13 +13,13 @@ static void kv_hdr(Model *m, int32_t *h, int nrec){
     Cfg *c=&m->c; int nic=0;
     for(int i=0;i<c->n_layers;i++) if(m->Ic && m->Ic[i]) nic++;
     h[0]=c->n_layers; h[1]=c->kv_lora; h[2]=c->qk_rope;
-    h[3]=m->has_dsa?c->index_hd:0; h[4]=nic; h[5]=c->vocab; h[6]=nrec; h[7]=0;
+    h[3]=(m->has_dsa||c->msa)?c->index_hd:0; h[4]=nic; h[5]=c->vocab; h[6]=nrec; h[7]=0;
 }
 
 static int64_t kv_rec_bytes(Model *m){
     Cfg *c=&m->c;
     int64_t rec = 4 + (int64_t)c->n_layers*(c->kv_lora+c->qk_rope)*4;
-    if(m->has_dsa) for(int i=0;i<c->n_layers;i++) if(m->Ic[i]) rec+=(int64_t)c->index_hd*4;
+    if(m->has_dsa||c->msa) for(int i=0;i<c->n_layers;i++) if(m->Ic[i]) rec+=(int64_t)c->index_hd*4;
     return rec;
 }
 
@@ -72,7 +73,7 @@ static void kv_disk_append(Model *m, const int *hist, int len){
             memcpy(b, m->Lc[i]+(int64_t)p*c->kv_lora, (size_t)c->kv_lora*4); b+=c->kv_lora*4;
             memcpy(b, m->Rc[i]+(int64_t)p*c->qk_rope,(size_t)c->qk_rope*4); b+=c->qk_rope*4;
         }
-        if(m->has_dsa) for(int i=0;i<c->n_layers;i++) if(m->Ic[i]){
+        if(m->has_dsa||c->msa) for(int i=0;i<c->n_layers;i++) if(m->Ic[i]){
             memcpy(b, m->Ic[i]+(int64_t)p*c->index_hd, (size_t)c->index_hd*4); b+=c->index_hd*4;
         }
         fwrite(k->disk_buf, 1, (size_t)rec, f);
@@ -104,7 +105,7 @@ static int kv_disk_load(Model *m, int *hist, int maxctx){
             if(fread(m->Lc[i]+(int64_t)p*c->kv_lora, 4, c->kv_lora, f)!=(size_t)c->kv_lora ||
                fread(m->Rc[i]+(int64_t)p*c->qk_rope, 4, c->qk_rope, f)!=(size_t)c->qk_rope){ nrec=p; goto out; }
         }
-        if(m->has_dsa) for(int i=0;i<c->n_layers;i++) if(m->Ic[i])
+        if(m->has_dsa||c->msa) for(int i=0;i<c->n_layers;i++) if(m->Ic[i])
             if(fread(m->Ic[i]+(int64_t)p*c->index_hd, 4, c->index_hd, f)!=(size_t)c->index_hd){ nrec=p; goto out; }
     }
 out:
